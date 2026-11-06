@@ -40,7 +40,7 @@ log = logging.getLogger("slide-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MODEL = os.getenv("AI_MODEL", "claude-sonnet-4-6")
-DEBUG = os.getenv("DEBUG", "0") == "1"  # 1 bo'lsa xato sababini chatda ko'rsatadi
+DEBUG = True
 PEXELS_KEY = os.getenv("PEXELS_API_KEY", "")  # rasmlar uchun (bepul: pexels.com/api)
 ai = AsyncAnthropic()  # ANTHROPIC_API_KEY ni o'zi oladi
 
