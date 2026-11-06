@@ -40,6 +40,7 @@ log = logging.getLogger("slide-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MODEL = os.getenv("AI_MODEL", "claude-sonnet-4-6")
+DEBUG = os.getenv("DEBUG", "0") == "1"  # 1 bo'lsa xato sababini chatda ko'rsatadi
 PEXELS_KEY = os.getenv("PEXELS_API_KEY", "")  # rasmlar uchun (bepul: pexels.com/api)
 ai = AsyncAnthropic()  # ANTHROPIC_API_KEY ni o'zi oladi
 
@@ -397,9 +398,12 @@ async def got_images(c: CallbackQuery, state: FSMContext):
             caption=f"✅ Tayyor! 📊 {count} slayd\n🎯 Mavzu: {topic}{note}\n\nYangi taqdimot: /new",
         )
         await status.delete()
-    except Exception:
+    except Exception as e:
         log.exception("Generatsiya xatosi")
-        await status.edit_text("😔 Xatolik bo'ldi. Qayta urinib ko'ring: /new")
+        msg = "😔 Xatolik bo'ldi. Qayta urinib ko'ring: /new"
+        if DEBUG:
+            msg += f"\n\n🐞 {type(e).__name__}: {str(e)[:300]}"
+        await status.edit_text(msg)
     finally:
         busy_users.discard(uid)
         await state.clear()
