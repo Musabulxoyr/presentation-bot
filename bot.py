@@ -1,17 +1,15 @@
 """
-📊 AI Slayd Bot
-Mavzu -> slayd soni -> dizayn -> tayyor .pptx fayl
+📊 AI Slayd Bot (TEKIN versiya)
+Mavzu -> slayd soni -> til -> dizayn -> rasm (ha/yo'q) -> tayyor .pptx
 
-O'rnatish:
-    pip install aiogram python-pptx anthropic aiohttp pillow
+Hammasi bepul:
+  • AI: Google Gemini (bepul kalit: aistudio.google.com/apikey)
+  • Rasm: Pexels (bepul kalit, ixtiyoriy) yoki Wikimedia Commons (kalitsiz)
 
-Ishga tushirish:
-    export BOT_TOKEN="telegram_bot_token"
-    export ANTHROPIC_API_KEY="sk-ant-..."
-    export PEXELS_API_KEY="..."   # ixtiyoriy, rasm qo'shish uchun
-    python bot.py
+O'rnatish:  pip install aiogram python-pptx aiohttp pillow
 """
 import asyncio
+import html
 import io
 import json
 import logging
@@ -20,7 +18,6 @@ import re
 import tempfile
 
 import aiohttp
-from PIL import Image
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -28,31 +25,47 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, FSInputFile, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from anthropic import AsyncAnthropic
+from PIL import Image
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Inches, Pt
 
+# ======================= SOZLAMALAR (shu yerni to'ldiring) =======================
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "BOT_TOKEN_NI_SHU_YERGA"
+GEMINI_KEY = os.getenv("GEMINI_API_KEY") or "GEMINI_KALITNI_SHU_YERGA"
+PEXELS_KEY = os.getenv("PEXELS_API_KEY") or ""  # ixtiyoriy; bo'sh bo'lsa Wikimedia ishlatiladi
+DEBUG = True  # xato sababini chatda ko'rsatadi; hammasi ishlab ketsa False qiling
+# =================================================================================
+
+MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"]  # biri band bo'lsa keyingisi
+UA = {"User-Agent": "AISlaydBot/1.0 (telegram bot)"}
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("slide-bot")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-MODEL = os.getenv("AI_MODEL", "claude-sonnet-4-6")
-DEBUG = True
-PEXELS_KEY = os.getenv("PEXELS_API_KEY", "")  # rasmlar uchun (bepul: pexels.com/api)
-ai = AsyncAnthropic()  # ANTHROPIC_API_KEY ni o'zi oladi
-
 SLIDE_COUNTS = [5, 8, 10, 12, 15, 18, 20]
 
-# nomi: (to'q fon, aksent, och fon, matn rangi)
+LANGS = {
+    "uz": ("🇺🇿 O'zbekcha", "Uzbek (Latin script)"),
+    "ru": ("🇷🇺 Русский", "Russian"),
+    "en": ("🇬🇧 English", "English"),
+}
+THANKS = {
+    "uz": ("E'tiboringiz uchun rahmat!", "Savollaringiz bormi?"),
+    "ru": ("Спасибо за внимание!", "Есть вопросы?"),
+    "en": ("Thank you for your attention!", "Any questions?"),
+}
+
+# nomi, to'q rang, aksent, och fon, matn rangi
 THEMES = {
-    "blue":   ("🔵 Ko'k",      "0B3D91", "2F80ED", "F4F8FF", "1F2937"),
-    "green":  ("🟢 Yashil",    "064E3B", "10B981", "F0FDF4", "1F2937"),
-    "purple": ("🟣 Binafsha",  "3B0764", "A855F7", "FAF5FF", "1F2937"),
+    "blue":   ("🔵 Ko'k",       "0B3D91", "2F80ED", "F4F8FF", "1F2937"),
+    "green":  ("🟢 Yashil",     "064E3B", "10B981", "F0FDF4", "1F2937"),
+    "purple": ("🟣 Binafsha",   "3B0764", "A855F7", "FAF5FF", "1F2937"),
     "orange": ("🟠 To'q sariq", "7C2D12", "F97316", "FFF7ED", "1F2937"),
-    "dark":   ("⚫️ Qora",      "111827", "38BDF8", "1F2937", "F9FAFB"),
+    "red":    ("🔴 Qizil",      "7F1D1D", "EF4444", "FEF2F2", "1F2937"),
+    "dark":   ("⚫️ Qora",       "0F172A", "38BDF8", "1E293B", "F1F5F9"),
 }
 
 router = Router()
@@ -63,7 +76,7 @@ class Form(StatesGroup):
     topic = State()
 
 
-# ---------------------------------------------------------------- keyboards
+# ================================ KLAVIATURALAR ================================
 def count_kb():
     kb = InlineKeyboardBuilder()
     for n in SLIDE_COUNTS:
@@ -72,9 +85,17 @@ def count_kb():
     return kb.as_markup()
 
 
+def lang_kb():
+    kb = InlineKeyboardBuilder()
+    for key, (name, _) in LANGS.items():
+        kb.button(text=name, callback_data=f"lang:{key}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def theme_kb():
     kb = InlineKeyboardBuilder()
-    for key, (name, *_rest) in THEMES.items():
+    for key, (name, *_r) in THEMES.items():
         kb.button(text=name, callback_data=f"theme:{key}")
     kb.adjust(2)
     return kb.as_markup()
@@ -88,48 +109,82 @@ def images_kb():
     return kb.as_markup()
 
 
-# ---------------------------------------------------------------- AI
+# ==================================== AI ====================================
+async def gemini(prompt: str) -> str:
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7},
+    }
+    last = "noma'lum xato"
+    timeout = aiohttp.ClientTimeout(total=150)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for model in MODELS:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            for attempt in range(2):
+                try:
+                    async with session.post(url, json=body,
+                                            headers={"x-goog-api-key": GEMINI_KEY}) as r:
+                        j = await r.json()
+                        if r.status == 200:
+                            parts = j["candidates"][0]["content"]["parts"]
+                            return "".join(p.get("text", "") for p in parts)
+                        msg = j.get("error", {}).get("message", str(j))
+                        last = f"{model} [{r.status}]: {msg}"
+                        if r.status in (400, 401, 403):
+                            raise RuntimeError(last)  # kalit/so'rov xato, boshqa model yordam bermaydi
+                        if r.status == 404:
+                            break  # model yo'q, keyingisiga o't
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    last = f"{model}: {type(e).__name__}"
+                await asyncio.sleep(3 * (attempt + 1))
+    raise RuntimeError(last)
+
+
 def extract_json(text: str) -> dict:
     text = re.sub(r"```(?:json)?", "", text)
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1:
+    a, b = text.find("{"), text.rfind("}")
+    if a == -1 or b == -1:
         raise ValueError("AI JSON qaytarmadi")
-    return json.loads(text[start : end + 1])
+    return json.loads(text[a : b + 1])
 
 
-async def generate_content(topic: str, total: int) -> dict:
-    content_slides = total - 2  # birinchi (titul) va oxirgi (rahmat) slaydlar alohida
-    prompt = f"""Mavzu: "{topic}"
+async def generate_content(topic: str, total: int, lang: str) -> dict:
+    n = total - 2  # titul va yakuniy slaydlar alohida
+    prompt = f"""Topic: "{topic}"
 
-Shu mavzuda professional taqdimot uchun matn tayyorla. O'zbek tilida (lotin yozuvi) yoz.
-Aynan {content_slides} ta asosiy slayd bo'lsin.
+Create content for a professional presentation. Write ALL text in {LANGS[lang][1]}.
+Exactly {n} main slides.
 
-FAQAT quyidagi JSON formatda javob ber, boshqa hech narsa yozma:
+Reply with ONLY this JSON, nothing else:
 {{
-  "title": "Taqdimot sarlavhasi",
-  "subtitle": "Qisqa tagsarlavha",
+  "title": "Presentation title",
+  "subtitle": "Short subtitle",
   "slides": [
-    {{"title": "Slayd sarlavhasi", "bullets": ["fikr 1", "fikr 2", "fikr 3", "fikr 4"], "image_query": "2-3 english words for stock photo search"}}
+    {{"title": "Slide title",
+      "bullets": ["point 1", "point 2", "point 3", "point 4"],
+      "notes": "2-3 sentences the presenter can say aloud for this slide",
+      "image_query": "2-3 ENGLISH words for a stock photo search"}}
   ]
 }}
 
-Qoidalar:
-- Har slaydda 3-5 ta band, har biri 8-18 so'zdan iborat, mazmunli va aniq.
-- Slaydlar mantiqiy ketma-ketlikda: kirish, asosiy qismlar, misollar/statistika, xulosa.
-- Sarlavhalar qisqa (6 so'zgacha)."""
-    resp = await ai.messages.create(
-        model=MODEL,
-        max_tokens=8000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    data = extract_json(resp.content[0].text)
-    slides = data.get("slides", [])
-    if not slides:
-        raise ValueError("Slaydlar bo'sh")
-    return data
+Rules:
+- Each slide has 3-5 bullets, each 8-18 words, concrete and informative (facts, numbers, examples).
+- Logical flow: introduction, main parts, examples/statistics, conclusion.
+- Slide titles are short (max 6 words).
+- image_query must be a concrete visual subject, always in English."""
+    last = None
+    for _ in range(2):
+        try:
+            data = extract_json(await gemini(prompt))
+            if data.get("slides"):
+                return data
+            last = ValueError("Slaydlar bo'sh")
+        except (ValueError, KeyError, json.JSONDecodeError) as e:
+            last = e
+    raise last
 
 
-# ---------------------------------------------------------------- IMAGES
+# =================================== RASMLAR ===================================
 IMG_W, IMG_H = 4.3, 4.8  # dyuym
 
 
@@ -149,19 +204,45 @@ def crop_image(raw: bytes) -> bytes:
     return out.getvalue()
 
 
-async def fetch_image(session: aiohttp.ClientSession, query: str):
+async def url_pexels(session, q):
+    async with session.get(
+        "https://api.pexels.com/v1/search",
+        params={"query": q, "per_page": 1, "orientation": "portrait"},
+        headers={"Authorization": PEXELS_KEY},
+    ) as r:
+        photos = (await r.json()).get("photos") or []
+    return photos[0]["src"]["large"] if photos else None
+
+
+async def url_commons(session, q):
+    params = {
+        "action": "query", "format": "json", "generator": "search",
+        "gsrsearch": f"filetype:bitmap {q}", "gsrnamespace": 6, "gsrlimit": 8,
+        "prop": "imageinfo", "iiprop": "url|mime|size", "iiurlwidth": 1000,
+    }
+    async with session.get("https://commons.wikimedia.org/w/api.php", params=params) as r:
+        pages = ((await r.json()).get("query") or {}).get("pages") or {}
+    for p in sorted(pages.values(), key=lambda x: x.get("index", 99)):
+        info = (p.get("imageinfo") or [{}])[0]
+        if info.get("mime") == "image/jpeg" and info.get("width", 0) >= 700:
+            return info.get("thumburl") or info.get("url")
+    return None
+
+
+async def fetch_image(session, query):
     if not query:
         return None
     try:
-        async with session.get(
-            "https://api.pexels.com/v1/search",
-            params={"query": query, "per_page": 1, "orientation": "portrait"},
-            headers={"Authorization": PEXELS_KEY},
-        ) as r:
-            photos = (await r.json()).get("photos") or []
-        if not photos:
+        url = None
+        if PEXELS_KEY:
+            url = await url_pexels(session, query)
+        if not url:
+            url = await url_commons(session, query)
+        if not url:
             return None
-        async with session.get(photos[0]["src"]["large"]) as r:
+        async with session.get(url) as r:
+            if r.status != 200:
+                return None
             raw = await r.read()
         return await asyncio.to_thread(crop_image, raw)
     except Exception as e:
@@ -169,35 +250,38 @@ async def fetch_image(session: aiohttp.ClientSession, query: str):
         return None
 
 
-async def fetch_all_images(slides: list) -> list:
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        return await asyncio.gather(
-            *[fetch_image(session, sl.get("image_query", "")) for sl in slides]
-        )
+async def fetch_all_images(slides):
+    timeout = aiohttp.ClientTimeout(total=25)
+    async with aiohttp.ClientSession(timeout=timeout, headers=UA) as session:
+        sem = asyncio.Semaphore(4)
+
+        async def one(sl):
+            async with sem:
+                return await fetch_image(session, sl.get("image_query", ""))
+
+        return await asyncio.gather(*[one(sl) for sl in slides])
 
 
-# ---------------------------------------------------------------- PPTX
-def rgb(hex_: str) -> RGBColor:
-    return RGBColor.from_string(hex_)
+# ==================================== PPTX ====================================
+def rgb(h):
+    return RGBColor.from_string(h)
 
 
-def set_bg(slide, color: str):
-    fill = slide.background.fill
-    fill.solid()
-    fill.fore_color.rgb = rgb(color)
+def set_bg(slide, color):
+    slide.background.fill.solid()
+    slide.background.fill.fore_color.rgb = rgb(color)
 
 
-def add_rect(slide, x, y, w, h, color):
-    shp = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, x, y, w, h)
-    shp.fill.solid()
-    shp.fill.fore_color.rgb = rgb(color)
-    shp.line.fill.background()
-    return shp
+def rect(slide, x, y, w, h, color, shape=MSO_SHAPE.RECTANGLE):
+    s = slide.shapes.add_shape(shape, x, y, w, h)
+    s.fill.solid()
+    s.fill.fore_color.rgb = rgb(color)
+    s.line.fill.background()
+    return s
 
 
-def add_text(slide, x, y, w, h, text, size, color, bold=False, align=PP_ALIGN.LEFT,
-             anchor=MSO_ANCHOR.TOP):
+def text(slide, x, y, w, h, t, size, color, bold=False, align=PP_ALIGN.LEFT,
+         anchor=MSO_ANCHOR.TOP):
     tb = slide.shapes.add_textbox(x, y, w, h)
     tf = tb.text_frame
     tf.word_wrap = True
@@ -205,7 +289,7 @@ def add_text(slide, x, y, w, h, text, size, color, bold=False, align=PP_ALIGN.LE
     p = tf.paragraphs[0]
     p.alignment = align
     r = p.add_run()
-    r.text = text
+    r.text = t
     r.font.size = Pt(size)
     r.font.bold = bold
     r.font.name = "Calibri"
@@ -213,8 +297,9 @@ def add_text(slide, x, y, w, h, text, size, color, bold=False, align=PP_ALIGN.LE
     return tb
 
 
-def build_pptx(data: dict, theme_key: str, path: str, images: list | None = None):
-    _, dark, accent, light, text = THEMES[theme_key]
+def build_pptx(data, theme_key, lang, path, images=None):
+    _, dark, accent, light, txt = THEMES[theme_key]
+    on_dark = "FFFFFF"
     prs = Presentation()
     prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
     W, H = prs.slide_width, prs.slide_height
@@ -222,72 +307,92 @@ def build_pptx(data: dict, theme_key: str, path: str, images: list | None = None
     slides = data["slides"]
     total = len(slides) + 2
 
-    # 1) Titul slayd
+    # --- Titul ---
     s = prs.slides.add_slide(blank)
     set_bg(s, dark)
-    add_rect(s, 0, 0, Inches(0.35), H, accent)
-    add_rect(s, Inches(1.2), Inches(4.35), Inches(2.2), Inches(0.08), accent)
-    add_text(s, Inches(1.2), Inches(1.9), Inches(10.8), Inches(2.4),
-             data.get("title", "Taqdimot"), 48, "FFFFFF", True, anchor=MSO_ANCHOR.BOTTOM)
-    add_text(s, Inches(1.2), Inches(4.6), Inches(10.8), Inches(1.2),
-             data.get("subtitle", ""), 22, "D1D5DB")
+    rect(s, 0, 0, Inches(0.35), H, accent)
+    rect(s, W - Inches(3.2), Inches(-1.2), Inches(4.2), Inches(4.2), accent, MSO_SHAPE.OVAL)
+    rect(s, W - Inches(2.2), Inches(5.3), Inches(3.0), Inches(3.0), accent, MSO_SHAPE.OVAL)
+    rect(s, Inches(1.2), Inches(4.4), Inches(2.2), Inches(0.08), accent)
+    text(s, Inches(1.2), Inches(1.7), Inches(9.0), Inches(2.6), data.get("title", ""), 46,
+         on_dark, True, anchor=MSO_ANCHOR.BOTTOM)
+    text(s, Inches(1.2), Inches(4.65), Inches(9.0), Inches(1.2), data.get("subtitle", ""), 22,
+         "D1D5DB")
 
-    # 2) Asosiy slaydlar
+    # --- Asosiy slaydlar ---
     for i, sl in enumerate(slides, start=2):
         s = prs.slides.add_slide(blank)
         set_bg(s, light)
-        add_rect(s, 0, 0, W, Inches(1.35), dark)
-        add_rect(s, 0, Inches(1.35), W, Inches(0.07), accent)
-        add_text(s, Inches(0.7), Inches(0.1), Inches(11.9), Inches(1.15),
-                 sl.get("title", ""), 32, "FFFFFF", True, anchor=MSO_ANCHOR.MIDDLE)
+        rect(s, 0, 0, W, Inches(1.35), dark)
+        rect(s, 0, Inches(1.35), W, Inches(0.07), accent)
+        badge = rect(s, Inches(0.55), Inches(0.35), Inches(0.65), Inches(0.65), accent,
+                     MSO_SHAPE.OVAL)
+        tf = badge.text_frame
+        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+        p = tf.paragraphs[0]
+        p.alignment = PP_ALIGN.CENTER
+        r = p.add_run()
+        r.text = str(i - 1)
+        r.font.size, r.font.bold = Pt(18), True
+        r.font.color.rgb = rgb("FFFFFF")
+        text(s, Inches(1.45), Inches(0.1), Inches(11.4), Inches(1.15), sl.get("title", ""), 30,
+             on_dark, True, anchor=MSO_ANCHOR.MIDDLE)
 
         img = images[i - 2] if images and images[i - 2] else None
-        text_w = Inches(6.9) if img else Inches(11.3)
+        text_w = Inches(6.9) if img else Inches(11.5)
         if img:
+            rect(s, Inches(8.4), Inches(1.8), Inches(IMG_W + 0.2), Inches(IMG_H + 0.2), accent)
             s.shapes.add_picture(io.BytesIO(img), Inches(8.5), Inches(1.9),
                                  Inches(IMG_W), Inches(IMG_H))
 
-        bullets = sl.get("bullets", [])[:6]
-        n = max(len(bullets), 1)
-        top, avail = Inches(1.9), Inches(4.8)
+        bullets = [b for b in sl.get("bullets", []) if b][:6] or [""]
+        n = len(bullets)
+        chars = sum(len(b) for b in bullets)
+        size = 22 if chars < 260 else 20 if chars < 340 else 18
+        if img:
+            size -= 2
+        top, avail = Inches(1.85), Inches(4.9)
         step = int(avail / n)
-        size = (20 if img else 22) if n <= 4 else (17 if img else 19)
         for j, b in enumerate(bullets):
             y = top + step * j
-            dot = s.shapes.add_shape(MSO_SHAPE.OVAL, Inches(0.8), y + Inches(0.12),
-                                     Inches(0.22), Inches(0.22))
-            dot.fill.solid()
-            dot.fill.fore_color.rgb = rgb(accent)
-            dot.line.fill.background()
-            add_text(s, Inches(1.25), y, text_w, step, b, size, text)
+            rect(s, Inches(0.8), y + Inches(0.13), Inches(0.2), Inches(0.2), accent,
+                 MSO_SHAPE.OVAL)
+            text(s, Inches(1.2), y, text_w, step, b, size, txt)
 
-        add_text(s, Inches(11.6), Inches(6.95), Inches(1.4), Inches(0.4),
-                 f"{i} / {total}", 12, "9CA3AF", align=PP_ALIGN.RIGHT)
+        text(s, Inches(11.6), Inches(6.95), Inches(1.4), Inches(0.4), f"{i} / {total}", 12,
+             "9CA3AF", align=PP_ALIGN.RIGHT)
+        if sl.get("notes"):
+            s.notes_slide.notes_text_frame.text = sl["notes"]
 
-    # 3) Rahmat slayd
+    # --- Yakuniy ---
     s = prs.slides.add_slide(blank)
     set_bg(s, dark)
-    add_rect(s, W - Inches(0.35), 0, Inches(0.35), H, accent)
-    add_text(s, 0, Inches(2.6), W, Inches(1.6), "E'tiboringiz uchun rahmat!", 46,
-             "FFFFFF", True, PP_ALIGN.CENTER, MSO_ANCHOR.MIDDLE)
-    add_text(s, 0, Inches(4.2), W, Inches(0.8), "Savollaringiz bormi?", 22,
-             "D1D5DB", align=PP_ALIGN.CENTER)
+    rect(s, W - Inches(0.35), 0, Inches(0.35), H, accent)
+    rect(s, Inches(-1.5), Inches(4.8), Inches(4.0), Inches(4.0), accent, MSO_SHAPE.OVAL)
+    t1, t2 = THANKS[lang]
+    text(s, 0, Inches(2.5), W, Inches(1.6), t1, 44, on_dark, True, PP_ALIGN.CENTER,
+         MSO_ANCHOR.MIDDLE)
+    text(s, 0, Inches(4.2), W, Inches(0.8), t2, 22, "D1D5DB", align=PP_ALIGN.CENTER)
 
     prs.save(path)
 
 
-# ---------------------------------------------------------------- handlers
-@router.message(CommandStart())
-@router.message(Command("new"))
-async def cmd_start(m: Message, state: FSMContext):
+# =================================== HANDLERS ===================================
+async def ask_topic(m: Message, state: FSMContext):
     await state.clear()
     await state.set_state(Form.topic)
     await m.answer(
         "👋 Salom! Men sizga professional taqdimot tayyorlab beraman.\n\n"
         "✍️ Taqdimot mavzusini yozing, masalan:\n"
-        "• <i>Global isish</i>\n• <i>Sun'iy intellekt kelajagi</i>",
+        "• <i>Global isish</i>\n• <i>Sun'iy intellekt kelajagi</i>\n• <i>Amir Temur</i>",
         parse_mode="HTML",
     )
+
+
+@router.message(CommandStart())
+@router.message(Command("new"))
+async def cmd_start(m: Message, state: FSMContext):
+    await ask_topic(m, state)
 
 
 @router.message(Command("cancel"))
@@ -301,41 +406,56 @@ async def cmd_cancel(m: Message, state: FSMContext):
 async def cmd_help(m: Message):
     await m.answer(
         "ℹ️ <b>Qanday ishlaydi?</b>\n"
-        "1️⃣ Mavzuni yozasiz\n2️⃣ Slayd sonini tanlaysiz\n3️⃣ Dizaynni tanlaysiz\n"
-        "4️⃣ Tayyor .pptx faylni olasiz\n\n"
+        "1️⃣ Mavzuni yozasiz\n2️⃣ Slayd sonini tanlaysiz\n3️⃣ Tilni tanlaysiz\n"
+        "4️⃣ Dizaynni tanlaysiz\n5️⃣ Rasm kerakmi — tanlaysiz\n"
+        "6️⃣ Tayyor .pptx faylni olasiz\n\n"
         "/new — yangi taqdimot\n/cancel — bekor qilish",
         parse_mode="HTML",
     )
 
 
-@router.message(Form.topic, F.text)
-async def got_topic(m: Message, state: FSMContext):
-    topic = m.text.strip()
+async def take_topic(m: Message, state: FSMContext):
+    topic = (m.text or "").strip()
     if len(topic) < 3 or len(topic) > 200:
         await m.answer("⚠️ Mavzu 3 dan 200 belgigacha bo'lishi kerak. Qayta yozing.")
         return
     await state.update_data(topic=topic)
-    await m.answer(f"📝 Mavzu: <b>{topic}</b>\n\n📊 Nechta slayd kerak?",
+    await m.answer(f"📝 Mavzu: <b>{html.escape(topic)}</b>\n\n📊 Nechta slayd kerak?",
                    parse_mode="HTML", reply_markup=count_kb())
+
+
+@router.message(Form.topic, F.text)
+async def got_topic(m: Message, state: FSMContext):
+    await take_topic(m, state)
 
 
 @router.callback_query(F.data.startswith("count:"))
 async def got_count(c: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    if "topic" not in data:
+    if "topic" not in await state.get_data():
         await c.answer("Avval mavzuni yozing: /new", show_alert=True)
         return
     n = int(c.data.split(":")[1])
     await state.update_data(count=n)
-    await c.message.edit_text(f"📊 Slaydlar soni: <b>{n}</b>\n\n🎨 Dizaynni tanlang:",
+    await c.message.edit_text(f"📊 Slaydlar soni: <b>{n}</b>\n\n🌐 Taqdimot tilini tanlang:",
+                              parse_mode="HTML", reply_markup=lang_kb())
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("lang:"))
+async def got_lang(c: CallbackQuery, state: FSMContext):
+    if "count" not in await state.get_data():
+        await c.answer("Avval /new ni bosing", show_alert=True)
+        return
+    lang = c.data.split(":")[1]
+    await state.update_data(lang=lang)
+    await c.message.edit_text(f"🌐 Til: <b>{LANGS[lang][0]}</b>\n\n🎨 Dizaynni tanlang:",
                               parse_mode="HTML", reply_markup=theme_kb())
     await c.answer()
 
 
 @router.callback_query(F.data.startswith("theme:"))
 async def got_theme(c: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    if "topic" not in data or "count" not in data:
+    if "lang" not in await state.get_data():
         await c.answer("Avval /new ni bosing", show_alert=True)
         return
     theme = c.data.split(":")[1]
@@ -349,8 +469,8 @@ async def got_theme(c: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("img:"))
 async def got_images(c: CallbackQuery, state: FSMContext):
     uid = c.from_user.id
-    data = await state.get_data()
-    if not all(k in data for k in ("topic", "count", "theme")):
+    d = await state.get_data()
+    if not all(k in d for k in ("topic", "count", "lang", "theme")):
         await c.answer("Avval /new ni bosing", show_alert=True)
         return
     if uid in busy_users:
@@ -358,44 +478,35 @@ async def got_images(c: CallbackQuery, state: FSMContext):
         return
 
     want_images = c.data.endswith("yes")
-    topic, count, theme = data["topic"], data["count"], data["theme"]
-    no_key = want_images and not PEXELS_KEY
-    if no_key:
-        want_images = False
-
+    topic, count, lang, theme = d["topic"], d["count"], d["lang"], d["theme"]
     busy_users.add(uid)
     await c.answer()
     status = await c.message.edit_text(
-        f"⏳ <b>{topic}</b> bo'yicha {count} slaydli taqdimot tayyorlanmoqda...\n"
+        f"⏳ <b>{html.escape(topic)}</b> bo'yicha {count} slaydli taqdimot tayyorlanmoqda...\n"
         "Bu 20-90 soniya olishi mumkin.", parse_mode="HTML")
 
     path = None
     try:
-        content = None
-        for attempt in range(3):
-            try:
-                content = await generate_content(topic, count)
-                break
-            except Exception as e:
-                log.warning("AI urinish %s xato: %s", attempt + 1, e)
-                if attempt == 2:
-                    raise
-                await asyncio.sleep(2)
+        content = await generate_content(topic, count, lang)
 
         images = None
         if want_images:
             await status.edit_text("🖼 Rasmlar qidirilmoqda...")
             images = await fetch_all_images(content["slides"])
+        found = sum(1 for x in (images or []) if x)
 
+        await status.edit_text("🛠 Fayl yig'ilmoqda...")
         fd, path = tempfile.mkstemp(suffix=".pptx")
         os.close(fd)
-        await asyncio.to_thread(build_pptx, content, theme, path, images)
+        await asyncio.to_thread(build_pptx, content, theme, lang, path, images)
 
         safe = re.sub(r"[^\w\-]+", "_", topic)[:40] or "taqdimot"
-        note = "\n⚠️ Rasm xizmati sozlanmagan, rasmsiz tayyorlandi." if no_key else ""
+        extra = f"\n🖼 Rasmlar: {found} ta" if want_images else ""
         await c.message.answer_document(
             FSInputFile(path, filename=f"{safe}.pptx"),
-            caption=f"✅ Tayyor! 📊 {count} slayd\n🎯 Mavzu: {topic}{note}\n\nYangi taqdimot: /new",
+            caption=(f"✅ Tayyor! 📊 {count} slayd\n🎯 Mavzu: {topic}{extra}\n"
+                     "🗣 Har slaydda ma'ruzachi uchun izohlar (Notes) bor.\n\n"
+                     "Yangi taqdimot: /new"),
         )
         await status.delete()
     except Exception as e:
@@ -411,19 +522,20 @@ async def got_images(c: CallbackQuery, state: FSMContext):
             os.remove(path)
 
 
-@router.message()
+@router.message(F.text)
 async def fallback(m: Message, state: FSMContext):
-    await state.set_state(Form.topic)
-    await got_topic(m, state) if m.text else await m.answer("✍️ Mavzuni matn ko'rinishida yozing.")
+    """Holat yo'qolgan bo'lsa (bot qayta ishga tushgan), matnni yangi mavzu deb olamiz."""
+    await take_topic(m, state)
 
 
 async def main():
-    if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN o'rnatilmagan")
+    if BOT_TOKEN.startswith("BOT_TOKEN_NI") or GEMINI_KEY.startswith("GEMINI_KALIT"):
+        raise SystemExit("❗ BOT_TOKEN va GEMINI_API_KEY ni kiriting (faylning yuqori qismida)")
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
+    log.info("Bot ishga tushdi")
     await dp.start_polling(bot)
 
 
