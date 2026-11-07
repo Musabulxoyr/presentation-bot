@@ -1,13 +1,20 @@
 """
-📊 AI Slayd Bot (TEKIN versiya)
-Mavzu -> slayd soni -> til -> rang -> maket -> rasm (ha/yo'q) -> tayyor .pptx
-Har 10 ta taqdimotdan ~3 tasidan keyin foydalanuvchidan baho/fikr so'raydi va adminga yuboradi.
+📊 AI Slayd Bot (TEKIN versiya) - KENGAYTIRILGAN
 
-Hammasi bepul:
-  • AI: Google Gemini (bepul kalit: aistudio.google.com/apikey)
-  • Rasm: Pexels (bepul kalit, ixtiyoriy) yoki Wikimedia Commons (kalitsiz)
+Mavzu (yoki PDF/DOCX/TXT fayl) -> slayd soni -> til -> rang -> maket (namuna rasm bilan)
+-> rasm (ha/yo'q) -> REJA tasdiqlash -> tayyor .pptx (+ PDF) -> tahrirlash / dizayn almashtirish.
 
-O'rnatish:  pip install aiogram python-pptx aiohttp pillow
+Imkoniyatlar:
+  - Reja tasdiqlash, grafik va jadval slaydlari, har slaydga izoh (Notes)
+  - Fayldan taqdimot (PDF, DOCX, TXT), muallif ismi va logo
+  - Slaydni tahrirlash (qayta yoz / qisqartir / misol / grafik / jadval / o'z ko'rsatmang)
+  - Dizaynni almashtirish (matnni qayta yaratmasdan), PDF variant, /history
+  - Referal tizimi, /broadcast, /stats, /user, /give
+  - Holat SQLite'da saqlanadi (bot qayta ishga tushsa yo'qolmaydi)
+  - Bir nechta Gemini kalit (GEMINI_API_KEYS=kalit1,kalit2), generatsiya navbati
+
+O'rnatish:  pip install -r requirements.txt
+PDF uchun serverda LibreOffice kerak (nixpacks.toml ga qarang); bo'lmasa PDF tugmasi chiqmaydi.
 """
 import asyncio
 import html
@@ -15,40 +22,55 @@ import io
 import json
 import logging
 import os
+import pickle
 import random
 import re
+import shutil
 import sqlite3
 import tempfile
 import time
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.exceptions import TelegramRetryAfter
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (CallbackQuery, FSInputFile, KeyboardButton, LabeledPrice,
-                           Message, PreCheckoutQuery, ReplyKeyboardMarkup)
+from aiogram.fsm.storage.base import BaseStorage, StorageKey
+from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, FSInputFile,
+                           KeyboardButton, LabeledPrice, Message, PreCheckoutQuery,
+                           ReplyKeyboardMarkup)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from pptx import Presentation
+from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
+from pptx.enum.chart import XL_CHART_TYPE, XL_LABEL_POSITION, XL_LEGEND_POSITION
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Inches, Pt
 
 # ======================= SOZLAMALAR (shu yerni to'ldiring) =======================
 BOT_TOKEN = os.getenv("BOT_TOKEN") or "BOT_TOKEN_NI_SHU_YERGA"
-GEMINI_KEY = os.getenv("GEMINI_API_KEY") or "GEMINI_KALITNI_SHU_YERGA"
+# Bitta kalit yoki vergul bilan bir nechta: GEMINI_API_KEYS=kalit1,kalit2,kalit3
+GEMINI_KEYS = [k.strip() for k in (os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY") or "").split(",")
+               if k.strip()] or ["GEMINI_KALITNI_SHU_YERGA"]
 PEXELS_KEY = os.getenv("PEXELS_API_KEY") or ""  # ixtiyoriy; bo'sh bo'lsa Wikimedia ishlatiladi
 ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)      # sizning Telegram ID raqamingiz (@userinfobot dan oling)
-CARD_NUMBER = os.getenv("CARD_NUMBER") or ""      # karta raqami, masalan 8600 1234 5678 9012
+CARD_NUMBER = os.getenv("CARD_NUMBER") or ""      # karta raqami
 CARD_OWNER = os.getenv("CARD_OWNER") or ""        # karta egasi ismi
 DB_PATH = os.getenv("DB_PATH") or "bot.db"        # Railway'da Volume ulasangiz: /data/bot.db
 
 FREE_LIMIT = 3          # har bir yangi foydalanuvchiga bepul taqdimotlar soni
 FEEDBACK_RATE = 0.3     # har 10 ta taqdimotdan ~3 tasidan keyin fikr so'raladi (sinash uchun 1.0 qiling)
+REF_BONUS = 1           # do'st birinchi taqdimotini yaratganda taklif qilganga beriladigan limit
+REF_MAX = 20            # bitta foydalanuvchi maksimal nechta do'st uchun bonus oladi
+EDIT_LIMIT = 5          # bitta taqdimotni bepul tahrirlash soni
+KEEP_DECKS = 10         # /history da saqlanadigan taqdimotlar soni
+KEEP_IMG = 3            # shulardan nechtasining rasmlari bazada saqlanadi (qolganlari kerak bo'lsa qayta qidiriladi)
+SOURCE_MAX = 20000      # fayldan olinadigan matn uzunligi (belgi)
+GEN_CONCURRENCY = int(os.getenv("GEN_CONCURRENCY") or 3)  # bir vaqtda nechta generatsiya
 # Balansni to'ldirish paketlari: (taqdimotlar soni, Stars narxi, so'm narxi)
 PACKS = [
     (1, 15, 3000),
@@ -61,7 +83,8 @@ DEBUG = True  # xato sababini chatda ko'rsatadi; hammasi ishlab ketsa False qili
 
 MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-flash-latest", "gemini-2.5-flash"]  # biri ishlamasa keyingisi
 _discovered: list | None = None
-UA = {"User-Agent": "AISlaydBot/1.0 (telegram bot)"}
+UA = {"User-Agent": "AISlaydBot/2.0 (telegram bot)"}
+PDF_OK = bool(shutil.which("soffice") or shutil.which("libreoffice"))
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("slide-bot")
@@ -103,18 +126,41 @@ STYLES = {
     "random":   "🎲 Tasodifiy",
 }
 STYLE_KEYS = [k for k in STYLES if k != "random"]
+STYLE_LABELS = {  # namuna rasmidagi yozuvlar (emoji'siz)
+    "classic": "Klassik", "side": "Yon panel", "minimal": "Minimal", "cards": "Kartochkali",
+    "split": "Ikki ustunli", "bignum": "Katta raqam", "timeline": "Chiziqli",
+    "gradient": "Gradient", "magazine": "Jurnal",
+}
+
+# Tahrirlash amallari: kalit -> (tugma nomi, AI uchun ko'rsatma)
+EDIT_ACTIONS = {
+    "rewrite": ("🔄 Qayta yoz", "Rewrite this slide with fresh wording and different facts and examples. Same topic."),
+    "short":   ("✂️ Qisqartir", "Make this slide shorter: exactly 3 concise bullets, each at most 12 words."),
+    "more":    ("➕ Ko'proq misol", "Expand this slide with more concrete examples, numbers and facts (5 bullets)."),
+    "chart":   ("📊 Grafikka aylantir", "Convert this slide into a chart slide (type chart) with realistic numbers relevant to its topic. Add a caption."),
+    "table":   ("🧮 Jadvalga aylantir", "Convert this slide into a table slide (type table) comparing relevant items. Add a caption."),
+}
 
 router = Router()
 busy_users: set[int] = set()
+bg_tasks: set = set()
+BOT_USERNAME = ""
+gen_sem: asyncio.Semaphore | None = None
+pdf_sem: asyncio.Semaphore | None = None
+_waiting = 0
 
 
 class Form(StatesGroup):
     topic = State()
     receipt = State()
     comment = State()
+    edit_text = State()
+    author = State()
+    logo = State()
+    broadcast = State()
 
 
-# ================================ BAZA (limit) ================================
+# ================================ BAZA ================================
 def db():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -136,53 +182,164 @@ def prepare_db_path():
         DB_PATH = "bot.db"
 
 
+def add_column(c, table: str, coldef: str):
+    try:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {coldef}")
+        c.commit()
+    except sqlite3.OperationalError:
+        pass  # ustun allaqachon bor
+
+
 def init_db():
     prepare_db_path()
     with closing(db()) as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS users(
             user_id INTEGER PRIMARY KEY, name TEXT, credits INTEGER NOT NULL,
-            made INTEGER NOT NULL DEFAULT 0, created INTEGER);
+            made INTEGER NOT NULL DEFAULT 0, created INTEGER,
+            referrer INTEGER, ref_paid INTEGER NOT NULL DEFAULT 0, author TEXT, logo BLOB);
         CREATE TABLE IF NOT EXISTS payments(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, kind TEXT,
             amount INTEGER, status TEXT, receipt TEXT, ts INTEGER, credits INTEGER);
         CREATE TABLE IF NOT EXISTS feedback(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT, topic TEXT,
             theme TEXT, style TEXT, score INTEGER, comment TEXT, ts INTEGER);
+        CREATE TABLE IF NOT EXISTS decks(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, topic TEXT, content TEXT,
+            theme TEXT, style TEXT, lang TEXT, want_images INTEGER, images BLOB,
+            edits INTEGER NOT NULL DEFAULT 0, ts INTEGER);
+        CREATE TABLE IF NOT EXISTS fsm(
+            key TEXT PRIMARY KEY, state TEXT, data TEXT NOT NULL DEFAULT '{}');
         """)
         c.commit()
-        try:  # eski bazalar uchun
-            c.execute("ALTER TABLE payments ADD COLUMN credits INTEGER")
+        # eski bazalar uchun
+        add_column(c, "payments", "credits INTEGER")
+        add_column(c, "users", "referrer INTEGER")
+        add_column(c, "users", "ref_paid INTEGER NOT NULL DEFAULT 0")
+        add_column(c, "users", "author TEXT")
+        add_column(c, "users", "logo BLOB")
+
+
+# ---------------- FSM holati SQLite'da (qayta ishga tushsa yo'qolmaydi) ----------------
+class SQLiteStorage(BaseStorage):
+    @staticmethod
+    def _k(key: StorageKey) -> str:
+        return f"{key.bot_id}:{key.chat_id}:{key.user_id}:{key.thread_id}:{key.destiny}"
+
+    async def set_state(self, key: StorageKey, state=None) -> None:
+        s = state.state if isinstance(state, State) else state
+        with closing(db()) as c:
+            c.execute("INSERT INTO fsm(key,state,data) VALUES(?,?,'{}') "
+                      "ON CONFLICT(key) DO UPDATE SET state=excluded.state", (self._k(key), s))
             c.commit()
-        except sqlite3.OperationalError:
-            pass
+
+    async def get_state(self, key: StorageKey):
+        with closing(db()) as c:
+            r = c.execute("SELECT state FROM fsm WHERE key=?", (self._k(key),)).fetchone()
+        return r["state"] if r else None
+
+    async def set_data(self, key: StorageKey, data) -> None:
+        with closing(db()) as c:
+            c.execute("INSERT INTO fsm(key,state,data) VALUES(?,NULL,?) "
+                      "ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                      (self._k(key), json.dumps(data, ensure_ascii=False)))
+            c.commit()
+
+    async def get_data(self, key: StorageKey) -> dict:
+        with closing(db()) as c:
+            r = c.execute("SELECT data FROM fsm WHERE key=?", (self._k(key),)).fetchone()
+        try:
+            return json.loads(r["data"]) if r else {}
+        except ValueError:
+            return {}
+
+    async def close(self) -> None:
+        pass
 
 
-def get_credits(uid: int, name: str = "") -> int:
-    if uid == ADMIN_ID:
-        return 10**6  # admin cheksiz
+# ---------------- Foydalanuvchilar / limit ----------------
+def ensure_user(uid: int, name: str = ""):
     with closing(db()) as c:
         c.execute("INSERT OR IGNORE INTO users(user_id,name,credits,created) VALUES(?,?,?,?)",
                   (uid, name, FREE_LIMIT, int(time.time())))
         c.commit()
+
+
+def user_exists(uid: int) -> bool:
+    with closing(db()) as c:
+        return c.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone() is not None
+
+
+def get_credits(uid: int, name: str = "") -> int:
+    ensure_user(uid, name)
+    if uid == ADMIN_ID:
+        return 10**6  # admin cheksiz
+    with closing(db()) as c:
         return c.execute("SELECT credits FROM users WHERE user_id=?", (uid,)).fetchone()[0]
 
 
 def add_credits(uid: int, n: int):
-    get_credits(uid)
+    ensure_user(uid)
     with closing(db()) as c:
         c.execute("UPDATE users SET credits=credits+? WHERE user_id=?", (n, uid))
         c.commit()
 
 
 def consume(uid: int):
+    """Limitni kamaytiradi. Agar bu foydalanuvchining birinchi taqdimoti bo'lsa va uni
+    kimdir taklif qilgan bo'lsa, taklif qilganga bonus beradi va uning ID sini qaytaradi."""
     if uid == ADMIN_ID:
-        return
+        return None
     with closing(db()) as c:
         c.execute("UPDATE users SET credits=MAX(credits-1,0), made=made+1 WHERE user_id=?", (uid,))
+        row = c.execute("SELECT referrer, ref_paid FROM users WHERE user_id=?", (uid,)).fetchone()
+        c.commit()
+    if row and row["referrer"] and not row["ref_paid"]:
+        ref = row["referrer"]
+        with closing(db()) as c:
+            paid = c.execute("SELECT COUNT(*) FROM users WHERE referrer=? AND ref_paid=1", (ref,)).fetchone()[0]
+            c.execute("UPDATE users SET ref_paid=1 WHERE user_id=?", (uid,))
+            c.commit()
+        if paid < REF_MAX:
+            add_credits(ref, REF_BONUS)
+            return ref
+    return None
+
+
+def set_referrer(uid: int, ref: int):
+    with closing(db()) as c:
+        c.execute("UPDATE users SET referrer=? WHERE user_id=? AND referrer IS NULL", (ref, uid))
         c.commit()
 
 
+def ref_stats(uid: int):
+    with closing(db()) as c:
+        a = c.execute("SELECT COUNT(*) FROM users WHERE referrer=?", (uid,)).fetchone()[0]
+        b = c.execute("SELECT COUNT(*) FROM users WHERE referrer=? AND ref_paid=1", (uid,)).fetchone()[0]
+    return a, b
+
+
+def get_profile(uid: int):
+    with closing(db()) as c:
+        r = c.execute("SELECT author, logo FROM users WHERE user_id=?", (uid,)).fetchone()
+    return ((r["author"] or ""), r["logo"]) if r else ("", None)
+
+
+def set_author(uid: int, name: str):
+    ensure_user(uid)
+    with closing(db()) as c:
+        c.execute("UPDATE users SET author=? WHERE user_id=?", (name or None, uid))
+        c.commit()
+
+
+def set_logo(uid: int, data):
+    ensure_user(uid)
+    with closing(db()) as c:
+        c.execute("UPDATE users SET logo=? WHERE user_id=?", (data, uid))
+        c.commit()
+
+
+# ---------------- To'lovlar / fikr ----------------
 def new_payment(uid, kind, amount, status, receipt="", credits=1) -> int:
     with closing(db()) as c:
         cur = c.execute("INSERT INTO payments(user_id,kind,amount,status,receipt,ts,credits) "
@@ -228,24 +385,77 @@ def set_comment(fid: int, uid: int, comment: str):
         return c.execute("SELECT * FROM feedback WHERE id=?", (fid,)).fetchone()
 
 
+# ---------------- Taqdimotlar tarixi ----------------
+def save_deck(uid, topic, content, theme, style, lang, want_images, images) -> int:
+    blob = pickle.dumps(images) if (want_images and images) else None
+    with closing(db()) as c:
+        cur = c.execute("INSERT INTO decks(user_id,topic,content,theme,style,lang,want_images,images,ts) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        (uid, topic, json.dumps(content, ensure_ascii=False), theme, style, lang,
+                         1 if want_images else 0, blob, int(time.time())))
+        did = cur.lastrowid
+        c.execute("DELETE FROM decks WHERE user_id=? AND id NOT IN "
+                  "(SELECT id FROM decks WHERE user_id=? ORDER BY id DESC LIMIT ?)", (uid, uid, KEEP_DECKS))
+        c.execute("UPDATE decks SET images=NULL WHERE user_id=? AND id NOT IN "
+                  "(SELECT id FROM decks WHERE user_id=? ORDER BY id DESC LIMIT ?)", (uid, uid, KEEP_IMG))
+        c.commit()
+    return did
+
+
+def get_deck(did: int, uid: int):
+    with closing(db()) as c:
+        return c.execute("SELECT * FROM decks WHERE id=? AND user_id=?", (did, uid)).fetchone()
+
+
+def list_decks(uid: int, limit: int = KEEP_DECKS):
+    with closing(db()) as c:
+        return c.execute("SELECT id, topic, ts FROM decks WHERE user_id=? ORDER BY id DESC LIMIT ?",
+                         (uid, limit)).fetchall()
+
+
+def update_deck(did: int, content, images, edits: int):
+    with closing(db()) as c:
+        c.execute("UPDATE decks SET content=?, images=?, edits=? WHERE id=?",
+                  (json.dumps(content, ensure_ascii=False), pickle.dumps(images) if images else None,
+                   edits, did))
+        c.commit()
+
+
+def set_deck_design(did: int, theme: str, style: str):
+    with closing(db()) as c:
+        c.execute("UPDATE decks SET theme=?, style=? WHERE id=?", (theme, style, did))
+        c.commit()
+
+
+def set_deck_images(did: int, images):
+    with closing(db()) as c:
+        c.execute("UPDATE decks SET images=? WHERE id=?", (pickle.dumps(images) if images else None, did))
+        c.commit()
+
+
 def som(n: int) -> str:
     return f"{n:,}".replace(",", " ")
 
 
 # ================================ KLAVIATURALAR ================================
 BTN_NEW = "📊 Yangi taqdimot"
+BTN_HIST = "🗂 Tarix"
 BTN_BAL = "💎 Balans"
 BTN_BUY = "➕ Balansni to'ldirish"
+BTN_REF = "🎁 Do'st taklif"
+BTN_SET = "⚙️ Sozlamalar"
 BTN_HELP = "ℹ️ Yordam"
 
 
 def main_kb():
     """Doimiy pastki menyu."""
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_BAL)],
-                  [KeyboardButton(text=BTN_BUY), KeyboardButton(text=BTN_HELP)]],
+        keyboard=[[KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_HIST)],
+                  [KeyboardButton(text=BTN_BAL), KeyboardButton(text=BTN_BUY)],
+                  [KeyboardButton(text=BTN_REF), KeyboardButton(text=BTN_SET)],
+                  [KeyboardButton(text=BTN_HELP)]],
         resize_keyboard=True, is_persistent=True,
-        input_field_placeholder="Mavzuni yozing yoki tugmani bosing")
+        input_field_placeholder="Mavzuni yozing, fayl yuboring yoki tugmani bosing")
 
 
 def count_kb():
@@ -264,18 +474,19 @@ def lang_kb():
     return kb.as_markup()
 
 
-def theme_kb():
+def theme_kb(prefix: str = "theme:"):
     kb = InlineKeyboardBuilder()
     for key, (name, *_r) in THEMES.items():
-        kb.button(text=name, callback_data=f"theme:{key}")
+        kb.button(text=name, callback_data=f"{prefix}{key}")
     kb.adjust(2)
     return kb.as_markup()
 
 
-def style_kb():
+def style_kb(prefix: str = "style:"):
     kb = InlineKeyboardBuilder()
-    for key, name in STYLES.items():
-        kb.button(text=name, callback_data=f"style:{key}")
+    for n, (key, name) in enumerate(STYLES.items(), start=1):
+        label = f"{n}. {name}" if key != "random" else name
+        kb.button(text=label, callback_data=f"{prefix}{key}")
     kb.adjust(2)
     return kb.as_markup()
 
@@ -301,13 +512,42 @@ def packs_kb():
     return kb.as_markup()
 
 
-pay_kb = packs_kb  # eski nom
-
-
 def images_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="🖼 Ha, rasm qo'shilsin", callback_data="img:yes")
     kb.button(text="📄 Yo'q, rasmsiz", callback_data="img:no")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def plan_kb(regen: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Ma'qul, boshlash", callback_data="plan:ok")
+    if regen < 2:
+        kb.button(text="🔄 Boshqa reja", callback_data="plan:redo")
+    kb.button(text="❌ Bekor qilish", callback_data="plan:no")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def deck_kb(did: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Tahrirlash", callback_data=f"ed:menu:{did}")
+    kb.button(text="🎨 Dizayn", callback_data=f"rd:menu:{did}")
+    if PDF_OK:
+        kb.button(text="📄 PDF", callback_data=f"pdf:{did}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+def settings_kb(has_author: bool, has_logo: bool):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👤 Muallif ismini o'zgartirish", callback_data="set:author")
+    kb.button(text="🖼 Logo yuklash", callback_data="set:logo")
+    if has_author:
+        kb.button(text="🗑 Muallifni o'chirish", callback_data="set:author_off")
+    if has_logo:
+        kb.button(text="🗑 Logoni o'chirish", callback_data="set:logo_off")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -322,7 +562,7 @@ async def discover_models(session) -> list:
     try:
         async with session.get(
             "https://generativelanguage.googleapis.com/v1beta/models",
-            params={"pageSize": 200}, headers={"x-goog-api-key": GEMINI_KEY},
+            params={"pageSize": 200}, headers={"x-goog-api-key": GEMINI_KEYS[0]},
         ) as r:
             j = await r.json()
         bad = ("image", "tts", "live", "audio", "embedding", "robotics", "computer", "native")
@@ -339,12 +579,52 @@ async def discover_models(session) -> list:
     return out
 
 
+_rr = 0
+
+
+def rotated_keys() -> list:
+    """Kalitlarni navbatma-navbat aylantiradi (yuk teng taqsimlansin)."""
+    global _rr
+    n = len(GEMINI_KEYS)
+    _rr = (_rr + 1) % n
+    return GEMINI_KEYS[_rr:] + GEMINI_KEYS[:_rr]
+
+
+async def call_gemini(session, model: str, key: str, body: dict):
+    """Natija: ('ok', matn) | ('key', xato) | ('quota', xato) | ('model', xato) | ('retry', xato)"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    try:
+        async with session.post(url, json=body, headers={"x-goog-api-key": key}) as r:
+            j = await r.json(content_type=None)
+            status = r.status
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        return "retry", f"{model}: {type(e).__name__}"
+    if status == 200:
+        try:
+            parts = j["candidates"][0]["content"]["parts"]
+            out = "".join(p.get("text", "") for p in parts)
+        except (KeyError, IndexError, TypeError):
+            return "model", f"{model}: javob bo'sh yoki bloklangan"
+        return ("ok", out) if out.strip() else ("model", f"{model}: bo'sh javob")
+    msg = (j.get("error", {}) or {}).get("message", str(j)) if isinstance(j, dict) else str(j)
+    err = f"{model} [{status}]: {msg[:120]}"
+    if status in (401, 403) or (status == 400 and "API key" in msg):
+        return "key", err
+    if status == 429:
+        return "quota", err
+    if status in (400, 404):
+        return "model", err
+    return "retry", err
+
+
 async def gemini(prompt: str) -> str:
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7},
     }
     errors = []
+    dead = set()
+    keys = rotated_keys()
     timeout = aiohttp.ClientTimeout(total=150)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         order = []
@@ -352,42 +632,106 @@ async def gemini(prompt: str) -> str:
             if m and m not in order:
                 order.append(m)
         for model in order[:8]:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-            for attempt in range(2):
-                try:
-                    async with session.post(url, json=body,
-                                            headers={"x-goog-api-key": GEMINI_KEY}) as r:
-                        j = await r.json()
-                        if r.status == 200:
-                            parts = j["candidates"][0]["content"]["parts"]
-                            txt = "".join(p.get("text", "") for p in parts)
-                            if txt.strip():
-                                return txt
-                            errors.append(f"{model}: bo'sh javob")
-                            break
-                        msg = j.get("error", {}).get("message", str(j))
-                        errors.append(f"{model} [{r.status}]: {msg[:120]}")
-                        if r.status in (401, 403) or (r.status == 400 and "API key" in msg):
-                            raise RuntimeError(errors[-1])  # kalit xato: boshqa model yordam bermaydi
-                        if r.status in (400, 404):
-                            break  # bu model yaroqsiz, keyingisiga o't
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    errors.append(f"{model}: {type(e).__name__}")
-                await asyncio.sleep(3 * (attempt + 1))
+            bad_model = False
+            for key in keys:
+                if key in dead:
+                    continue
+                for attempt in range(2):
+                    kind, val = await call_gemini(session, model, key, body)
+                    if kind == "ok":
+                        return val
+                    errors.append(val)
+                    if kind == "key":
+                        dead.add(key)  # kalit xato: boshqa kalitga o't
+                        break
+                    if kind == "quota":
+                        break  # limit tugadi: boshqa kalitga o't
+                    if kind == "model":
+                        bad_model = True
+                        break
+                    await asyncio.sleep(3 * (attempt + 1))
+                if bad_model:
+                    break
+            if len(dead) == len(keys):
+                raise RuntimeError(errors[-1] if errors else "API kalit xato")
     raise RuntimeError(" | ".join(errors[-3:]) or "noma'lum xato")
 
 
-def extract_json(text: str) -> dict:
-    text = re.sub(r"```(?:json)?", "", text)
-    a, b = text.find("{"), text.rfind("}")
+def extract_json(raw: str) -> dict:
+    raw = re.sub(r"```(?:json)?", "", raw)
+    a, b = raw.find("{"), raw.rfind("}")
     if a == -1 or b == -1:
         raise ValueError("AI JSON qaytarmadi")
-    return json.loads(text[a : b + 1])
+    return json.loads(raw[a : b + 1])
 
 
-async def generate_content(topic: str, total: int, lang: str) -> dict:
+# ---------------- Slayd ma'lumotini tekshirish ----------------
+CHART_KINDS = ("column", "bar", "line", "pie")
+
+SLIDE_SCHEMA = """Slide object formats (pick "type" for each slide):
+1) {"type":"bullets","title":"Slide title","bullets":["point 1","point 2","point 3","point 4"],"notes":"2-3 sentences the presenter can say aloud","image_query":"2-3 ENGLISH words for a stock photo search"}
+2) {"type":"chart","title":"Slide title","chart":{"kind":"column|bar|line|pie","series":"What is measured (with unit)","categories":["A","B","C"],"values":[10,20,30]},"caption":"one-sentence takeaway","bullets":["fallback point 1","fallback point 2","fallback point 3"],"notes":"..."}
+3) {"type":"table","title":"Slide title","table":{"headers":["Col 1","Col 2","Col 3"],"rows":[["a","b","c"],["d","e","f"]]},"caption":"one-sentence takeaway","bullets":["fallback point 1","fallback point 2","fallback point 3"],"notes":"..."}"""
+
+
+def _num(x):
+    try:
+        if isinstance(x, str):
+            x = x.replace(" ", "").replace(",", ".").rstrip("%")
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def norm_slide(sl: dict) -> dict:
+    """AI qaytargan slaydni tekshiradi; grafik/jadval noto'g'ri bo'lsa oddiy slaydga aylantiradi."""
+    out = {
+        "type": "bullets",
+        "title": str(sl.get("title", "")).strip()[:90],
+        "bullets": [str(b).strip() for b in (sl.get("bullets") or []) if str(b).strip()][:6],
+        "notes": str(sl.get("notes", "")).strip(),
+        "image_query": str(sl.get("image_query", "")).strip(),
+        "caption": str(sl.get("caption", "")).strip()[:160],
+    }
+    kind = str(sl.get("type", "bullets")).lower()
+    if kind == "chart" and isinstance(sl.get("chart"), dict):
+        ch = sl["chart"]
+        cats = [str(x).strip()[:30] for x in (ch.get("categories") or [])]
+        vals = [_num(v) for v in (ch.get("values") or [])]
+        pairs = [(a, b) for a, b in zip(cats, vals) if a and b is not None][:8]
+        ck = str(ch.get("kind", "column")).lower()
+        if ck not in CHART_KINDS:
+            ck = "column"
+        pie_bad = ck == "pie" and (any(v < 0 for _, v in pairs) or sum(v for _, v in pairs) <= 0)
+        if len(pairs) >= 2 and not pie_bad:
+            out["type"] = "chart"
+            out["chart"] = {"kind": ck, "series": str(ch.get("series") or out["title"])[:40],
+                            "categories": [a for a, _ in pairs], "values": [b for _, b in pairs]}
+    elif kind == "table" and isinstance(sl.get("table"), dict):
+        tb = sl["table"]
+        headers = [str(h).strip()[:30] for h in (tb.get("headers") or [])][:5]
+        if len(headers) >= 2:
+            rows = []
+            for r in (tb.get("rows") or [])[:7]:
+                if isinstance(r, (list, tuple)):
+                    cells = [str(x).strip()[:60] for x in r][:len(headers)]
+                    cells += [""] * (len(headers) - len(cells))
+                    rows.append(cells)
+            if len(rows) >= 2:
+                out["type"] = "table"
+                out["table"] = {"headers": headers, "rows": rows}
+    if out["type"] == "bullets" and not out["bullets"]:
+        out["bullets"] = [out["caption"] or out["title"] or "-"]
+    return out
+
+
+async def generate_content(topic: str, total: int, lang: str, source: str = "") -> dict:
     n = total - 2  # titul va yakuniy slaydlar alohida
-    prompt = f"""Topic: "{topic}"
+    src = ""
+    if source:
+        src = ('\n\nSource material. Base the presentation ONLY on this text and do not invent '
+               'facts that contradict it:\n"""\n' + source + '\n"""')
+    prompt = f"""Topic: "{topic}"{src}
 
 Create content for a professional presentation. Write ALL text in {LANGS[lang][1]}.
 Exactly {n} main slides.
@@ -396,16 +740,14 @@ Reply with ONLY this JSON, nothing else:
 {{
   "title": "Presentation title",
   "subtitle": "Short subtitle",
-  "slides": [
-    {{"title": "Slide title",
-      "bullets": ["point 1", "point 2", "point 3", "point 4"],
-      "notes": "2-3 sentences the presenter can say aloud for this slide",
-      "image_query": "2-3 ENGLISH words for a stock photo search"}}
-  ]
+  "slides": [ ...{n} slide objects... ]
 }}
 
+{SLIDE_SCHEMA}
+
 Rules:
-- Each slide has 3-5 bullets, each 8-18 words, concrete and informative (facts, numbers, examples).
+- Most slides are type "bullets": 3-5 bullets, each 8-18 words, concrete and informative (facts, numbers, examples).
+- Use at most 2 slides of type "chart" or "table", and ONLY if the topic has real numeric or comparative data (otherwise use only "bullets"). Chart: 3-6 categories, values are plain numbers (put the unit in "series"). Table: 3-5 columns, 3-6 rows. Use well-known approximate figures and never fabricate precise statistics.
 - Logical flow: introduction, main parts, examples/statistics, conclusion.
 - Slide titles are short (max 6 words).
 - image_query must be a concrete visual subject, always in English."""
@@ -413,12 +755,90 @@ Rules:
     for _ in range(2):
         try:
             data = extract_json(await gemini(prompt))
-            if data.get("slides"):
-                return data
+            raw = data.get("slides")
+            if isinstance(raw, list):
+                slides = [norm_slide(s) for s in raw if isinstance(s, dict)][:n]
+                if slides:
+                    return {"title": str(data.get("title", "")).strip(),
+                            "subtitle": str(data.get("subtitle", "")).strip(), "slides": slides}
             last = ValueError("Slaydlar bo'sh")
         except (ValueError, KeyError, json.JSONDecodeError) as e:
             last = e
     raise last
+
+
+async def edit_slide(topic: str, lang: str, slide: dict, instruction: str) -> dict:
+    cur = {k: v for k, v in slide.items() if k != "image_query" or v}
+    prompt = f"""Presentation topic: "{topic}". Write ALL text in {LANGS[lang][1]}.
+
+Current slide (JSON):
+{json.dumps(cur, ensure_ascii=False)}
+
+Task: {instruction}
+
+{SLIDE_SCHEMA}
+
+Reply with ONLY the JSON object of the new slide. Keep it concrete and informative."""
+    last = None
+    for _ in range(2):
+        try:
+            data = extract_json(await gemini(prompt))
+            new = norm_slide(data)
+            if not new["title"]:
+                new["title"] = slide.get("title", "")
+            if not new["notes"]:
+                new["notes"] = slide.get("notes", "")
+            if not new["image_query"]:
+                new["image_query"] = slide.get("image_query", "")
+            return new
+        except (ValueError, KeyError, json.JSONDecodeError) as e:
+            last = e
+    raise last
+
+
+# ---------------- Fayldan matn olish ----------------
+def extract_text(path: str, ext: str) -> str:
+    if ext == "pdf":
+        from pypdf import PdfReader
+        reader = PdfReader(path)
+        out = "\n".join((p.extract_text() or "") for p in reader.pages[:60])
+    elif ext == "docx":
+        import docx
+        d = docx.Document(path)
+        out = "\n".join(p.text for p in d.paragraphs)
+        for t in d.tables:
+            for row in t.rows:
+                out += "\n" + " | ".join(cell.text for cell in row.cells)
+    else:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            out = f.read()
+    out = re.sub(r"[ \t]+", " ", out)
+    out = re.sub(r"\n\s*\n+", "\n", out).strip()
+    return out[:SOURCE_MAX]
+
+
+# ---------------- Navbat ----------------
+@asynccontextmanager
+async def gen_slot(status: Message | None = None):
+    """Bir vaqtda GEN_CONCURRENCY tadan ko'p generatsiya ketmasin; qolganlar navbatda turadi."""
+    global _waiting
+    queued = gen_sem.locked()
+    if queued:
+        _waiting += 1
+        if status is not None:
+            try:
+                await status.edit_text(f"🕐 Navbatdasiz: {_waiting}-o'rin. Biroz kuting, tez orada boshlanadi...")
+            except Exception:
+                pass
+    try:
+        await gen_sem.acquire()
+    finally:
+        if queued:
+            _waiting -= 1
+    try:
+        yield
+    finally:
+        gen_sem.release()
 
 
 # =================================== RASMLAR ===================================
@@ -435,9 +855,9 @@ def crop_image(raw: bytes) -> bytes:
     else:
         nh = int(w / target)
         img = img.crop((0, (h - nh) // 2, w, (h - nh) // 2 + nh))
-    img.thumbnail((1000, 1100))
+    img.thumbnail((900, 1000))
     out = io.BytesIO()
-    img.save(out, "JPEG", quality=85)
+    img.save(out, "JPEG", quality=80)
     return out.getvalue()
 
 
@@ -488,15 +908,138 @@ async def fetch_image(session, query):
 
 
 async def fetch_all_images(slides):
+    """Faqat oddiy (bullets) slaydlar uchun rasm qidiradi; grafik/jadval slaydlarga rasm kerak emas."""
     timeout = aiohttp.ClientTimeout(total=25)
     async with aiohttp.ClientSession(timeout=timeout, headers=UA) as session:
         sem = asyncio.Semaphore(4)
 
         async def one(sl):
+            if sl.get("type", "bullets") != "bullets":
+                return None
             async with sem:
                 return await fetch_image(session, sl.get("image_query", ""))
 
         return await asyncio.gather(*[one(sl) for sl in slides])
+
+
+def prep_logo(raw: bytes) -> bytes:
+    """Logoni PNG ga o'tkazadi (shaffoflik saqlanadi) va kichraytiradi."""
+    img = Image.open(io.BytesIO(raw)).convert("RGBA")
+    img.thumbnail((500, 500))
+    out = io.BytesIO()
+    img.save(out, "PNG")
+    return out.getvalue()
+
+
+# ============================ MAKET NAMUNALARI (preview) ============================
+def draw_tile(d, x0, y0, w, h, style, dark, accent, light, txt):
+    """Bitta maketning soddalashtirilgan rasmini chizadi."""
+    ln = mix(txt, light, 0.5)
+    head = "FFFFFF" if lum(light) < 0.4 else dark
+    white = "FFFFFF" if lum(light) >= 0.4 else mix(light, "FFFFFF", 0.1)
+
+    def R(a, b, c, e, col):
+        d.rectangle([x0 + a * w, y0 + b * h, x0 + c * w, y0 + e * h], fill="#" + col)
+
+    def O(cx, cy, r, col):
+        d.ellipse([x0 + cx * w - r, y0 + cy * h - r, x0 + cx * w + r, y0 + cy * h + r], fill="#" + col)
+
+    def lines(x1, y1, x2, n, gap=0.13, col=None, dots=None):
+        for k in range(n):
+            yy = y1 + k * gap
+            if dots:
+                O(x1 - 0.04, yy + 0.017, 5, dots)
+            R(x1, yy, x2 - (0.12 if k % 2 else 0), yy + 0.035, col or ln)
+
+    if style == "gradient":
+        gb, gt = mix(dark, accent, 0.4), dark
+        for yy in range(int(h)):
+            d.line([x0, y0 + yy, x0 + w, y0 + yy], fill="#" + mix(gt, gb, yy / h))
+        R(0, 0, 1, .04, accent)
+        O(.08, .13, 10, accent)
+        R(.15, .11, .62, .15, "FFFFFF")
+        lines(.12, .34, .85, 4, col="D1D5DB", dots=accent)
+        return
+    bg = "FFFFFF" if style == "magazine" else light
+    R(0, 0, 1, 1, bg)
+    if style == "classic":
+        R(0, 0, 1, .2, dark)
+        R(0, .2, 1, .225, accent)
+        O(.07, .1, 10, accent)
+        R(.14, .085, .6, .12, "FFFFFF")
+        lines(.12, .36, .85, 4, dots=accent)
+    elif style == "side":
+        R(0, 0, .3, 1, dark)
+        R(.3, 0, .312, 1, accent)
+        R(.05, .12, .14, .22, accent)
+        R(.05, .32, .24, .36, "FFFFFF")
+        R(.05, .4, .2, .44, "FFFFFF")
+        lines(.4, .15, .93, 5, gap=.14, dots=accent)
+    elif style == "minimal":
+        R(.08, .08, .16, .13, accent)
+        R(.08, .2, .7, .27, head)
+        R(.08, .31, .2, .325, accent)
+        lines(.1, .45, .9, 4, dots=accent)
+    elif style == "cards":
+        O(.09, .12, 10, accent)
+        R(.16, .1, .6, .14, head)
+        for r_ in range(2):
+            for c_ in range(2):
+                x, y = .08 + c_ * .45, .3 + r_ * .3
+                R(x, y, x + .42, y + .26, white)
+                R(x, y, x + .02, y + .26, accent)
+                R(x + .05, y + .08, x + .35, y + .1, ln)
+                R(x + .05, y + .15, x + .28, y + .17, ln)
+    elif style == "split":
+        R(0, 0, .38, 1, dark)
+        R(.38, 0, .392, 1, accent)
+        R(.06, .25, .3, .5, accent)
+        R(.06, .6, .3, .66, "FFFFFF")
+        lines(.47, .15, .94, 5, gap=.14, dots=accent)
+    elif style == "bignum":
+        R(.06, .06, .32, .3, accent)
+        R(.4, .12, .9, .2, head)
+        R(.06, .38, .94, .395, accent)
+        lines(.1, .5, .9, 4, gap=.12, dots=accent)
+    elif style == "timeline":
+        R(.08, .2, .9, .23, bg)
+        R(.1, .22, .112, .86, accent)
+        R(.08, .06, .6, .12, head)
+        for k in range(4):
+            O(.106, .24 + k * .2, 8, accent)
+            R(.17, .22 + k * .2, .82 - .1 * (k % 2), .255 + k * .2, ln)
+    else:  # magazine
+        R(.06, .08, .8, .18, "111111")
+        R(.06, .28, .94, .285, "111111")
+        R(.06, .275, .25, .295, accent)
+        for k in range(4):
+            R(.06, .4 + k * .14, .12, .46 + k * .14, accent)
+            R(.16, .41 + k * .14, .82 - .1 * (k % 2), .445 + k * .14, "9CA3AF")
+
+
+def style_preview(theme_key: str) -> bytes:
+    """Barcha 9 maketning tanlangan rangdagi namunasi (3x3 jadval)."""
+    _, dark, accent, light, txt = THEMES[theme_key]
+    tw, th, g = 400, 225, 14
+    cols, rows = 3, 3
+    im = Image.new("RGB", (cols * tw + (cols + 1) * g, rows * th + (rows + 1) * g), "#E5E7EB")
+    d = ImageDraw.Draw(im)
+    try:
+        font = ImageFont.load_default(size=20)
+    except TypeError:
+        font = ImageFont.load_default()
+    for n, key in enumerate(STYLE_KEYS):
+        r_, c_ = divmod(n, cols)
+        x0, y0 = g + c_ * (tw + g), g + r_ * (th + g)
+        draw_tile(d, x0, y0, tw, th, key, dark, accent, light, txt)
+        d.rectangle([x0, y0, x0 + tw - 1, y0 + th - 1], outline="#9CA3AF")
+        label = f"{n + 1}. {STYLE_LABELS[key]}"
+        lw = d.textlength(label, font=font)
+        d.rectangle([x0 + 8, y0 + th - 36, x0 + 24 + lw, y0 + th - 8], fill="#111827")
+        d.text((x0 + 16, y0 + th - 34), label, fill="#FFFFFF", font=font)
+    out = io.BytesIO()
+    im.save(out, "JPEG", quality=85)
+    return out.getvalue()
 
 
 # ==================================== PPTX ====================================
@@ -641,7 +1184,137 @@ def put_image(s, img, x, y, w, h, frame, accent):
     s.shapes.add_picture(io.BytesIO(img), Inches(x), Inches(y), Inches(w), Inches(h))
 
 
-def build_pptx(data, theme_key, style, lang, path, images=None):
+def add_logo(s, logo: bytes):
+    """Titul slaydning o'ng yuqori burchagiga oq fonli logo qo'yadi."""
+    try:
+        iw, ih = Image.open(io.BytesIO(logo)).size
+    except Exception:
+        return
+    bw, bh = 1.9, 1.2
+    k = min(bw / iw, bh / ih)
+    w, h = iw * k, ih * k
+    bx, by = 13.333 - 0.7 - bw, 0.45
+    rect(s, Inches(bx - 0.12), Inches(by - 0.12), Inches(bw + 0.24), Inches(bh + 0.24), "FFFFFF")
+    s.shapes.add_picture(io.BytesIO(logo), Inches(bx + (bw - w) / 2), Inches(by + (bh - h) / 2),
+                         Inches(w), Inches(h))
+
+
+# Grafik/jadval slaydlari uchun joy: (x, y, eni, bo'yi) dyuymda - maketga qarab
+AREA = {
+    "classic": (0.8, 1.85, 11.7, 4.85), "side": (3.6, 1.0, 9.1, 5.7),
+    "minimal": (0.8, 2.2, 11.7, 4.5), "cards": (0.8, 1.85, 11.7, 4.85),
+    "split": (5.9, 1.0, 6.9, 5.7), "bignum": (0.8, 3.1, 11.7, 3.65),
+    "timeline": (1.0, 2.0, 11.7, 4.7), "gradient": (0.8, 1.9, 11.7, 4.8),
+    "magazine": (0.8, 2.85, 11.7, 3.95),
+}
+PIE_COLORS = ["2F80ED", "10B981", "F59E0B", "EF4444", "A855F7", "14B8A6", "F97316", "64748B"]
+AUTHOR_X = {"classic": 1.2, "side": 5.2, "minimal": 1.2, "cards": 1.7, "split": 0.9,
+            "bignum": 1.0, "timeline": 2.4, "gradient": 1.2, "magazine": 0.8}
+
+
+def draw_chart(s, sl, x, y, w, h, body, accent):
+    ch = sl["chart"]
+    kind = ch["kind"]
+    cd = CategoryChartData()
+    cd.categories = ch["categories"]
+    cd.add_series(ch["series"], ch["values"])
+    ctype = {"column": XL_CHART_TYPE.COLUMN_CLUSTERED, "bar": XL_CHART_TYPE.BAR_CLUSTERED,
+             "line": XL_CHART_TYPE.LINE_MARKERS, "pie": XL_CHART_TYPE.PIE}[kind]
+    chart = s.shapes.add_chart(ctype, Inches(x), Inches(y), Inches(w), Inches(h), cd).chart
+    chart.font.size = Pt(14)
+    chart.font.name = "Calibri"
+    chart.font.color.rgb = rgb(body)
+    chart.has_title = False
+    plot = chart.plots[0]
+    plot.has_data_labels = True
+    dl = plot.data_labels
+    dl.font.size = Pt(14)
+    dl.font.color.rgb = rgb(body)
+    if kind == "pie":
+        chart.has_legend = True
+        chart.legend.position = XL_LEGEND_POSITION.RIGHT
+        chart.legend.include_in_layout = False
+        chart.legend.font.size = Pt(15)
+        chart.legend.font.color.rgb = rgb(body)
+        dl.show_percentage = True
+        dl.show_value = False
+        dl.number_format = "0%"
+        dl.number_format_is_linked = False
+        dl.font.bold = True
+        dl.font.color.rgb = rgb("FFFFFF")
+        palette = [accent] + PIE_COLORS[1:]
+        ser = plot.series[0]
+        for i in range(len(ch["values"])):
+            pt = ser.points[i]
+            pt.format.fill.solid()
+            pt.format.fill.fore_color.rgb = rgb(palette[i % len(palette)])
+        return
+    chart.has_legend = False
+    dl.show_value = True
+    ser = plot.series[0]
+    if kind == "line":
+        dl.position = XL_LABEL_POSITION.ABOVE
+        ser.smooth = False
+        ser.format.line.color.rgb = rgb(accent)
+        ser.format.line.width = Pt(3)
+    else:
+        dl.position = XL_LABEL_POSITION.OUTSIDE_END
+        plot.gap_width = 60
+        ser.format.fill.solid()
+        ser.format.fill.fore_color.rgb = rgb(accent)
+    for ax in (chart.category_axis, chart.value_axis):
+        ax.tick_labels.font.size = Pt(14)
+        ax.tick_labels.font.color.rgb = rgb(body)
+    chart.value_axis.has_major_gridlines = True
+    chart.value_axis.major_gridlines.format.line.color.rgb = rgb("9CA3AF")
+
+
+def draw_table(s, sl, x, y, w, h, accent, dark, dark_now):
+    tb = sl["table"]
+    rows = [tb["headers"]] + tb["rows"]
+    nr, nc = len(rows), len(tb["headers"])
+    tbl = s.shapes.add_table(nr, nc, Inches(x), Inches(y), Inches(w), Inches(h)).table
+    for r in range(nr):
+        tbl.rows[r].height = Inches(h / nr)
+    size = 12 if (nc >= 4 and nr > 5) else 14 if (nc >= 4 or nr > 5) else 16
+    hdr_txt = "FFFFFF" if lum(accent) < 0.6 else "0F172A"
+    if dark_now:
+        fills, body_txt = (mix(dark, "FFFFFF", 0.10), mix(dark, "FFFFFF", 0.18)), "F1F5F9"
+    else:
+        fills, body_txt = ("FFFFFF", "F3F4F6"), "1F2937"
+    for r, row in enumerate(rows):
+        for c_, val in enumerate(row):
+            cell = tbl.cell(r, c_)
+            cell.fill.solid()
+            cell.fill.fore_color.rgb = rgb(accent if r == 0 else fills[r % 2])
+            cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+            cell.margin_left = Inches(0.12)
+            cell.margin_right = Inches(0.12)
+            tf = cell.text_frame
+            tf.word_wrap = True
+            run = tf.paragraphs[0].add_run()
+            run.text = val
+            run.font.size = Pt(size)
+            run.font.name = "Calibri"
+            run.font.bold = (r == 0 or c_ == 0)
+            run.font.color.rgb = rgb(hdr_txt if r == 0 else body_txt)
+
+
+def draw_rich(s, sl, area, body, accent, dark, dark_now):
+    """Grafik yoki jadval slaydining asosiy qismi (+ pastda bir qatorli xulosa)."""
+    x, y, w, h = area
+    cap = sl.get("caption", "")
+    ch_h = h - (0.8 if cap else 0)
+    if sl["type"] == "chart":
+        draw_chart(s, sl, x, y, w, ch_h, body, accent)
+    else:
+        draw_table(s, sl, x, y, w, ch_h, accent, dark, dark_now)
+    if cap:
+        text(s, Inches(x), Inches(y + ch_h + 0.05), Inches(w), Inches(0.7), cap, 16, body,
+             anchor=MSO_ANCHOR.MIDDLE)
+
+
+def build_pptx(data, theme_key, style, lang, path, images=None, author="", logo=None):
     _, dark, accent, light, txt = THEMES[theme_key]
     if style not in STYLE_KEYS:
         style = "classic"
@@ -652,6 +1325,7 @@ def build_pptx(data, theme_key, style, lang, path, images=None):
     card = mix(light, "FFFFFF", 0.1) if bg_dark else "FFFFFF"
     g_bottom, g_top = mix(dark, accent, 0.4), dark   # gradient ranglari
     g_txt = "F1F5F9"
+    dark_now = style == "gradient" or (bg_dark and style != "magazine")  # slayd foni to'qmi
 
     prs = Presentation()
     prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
@@ -744,12 +1418,20 @@ def build_pptx(data, theme_key, style, lang, path, images=None):
         text(s, Inches(0.8), Inches(5.0), Inches(11.7), Inches(1.3), sub_t, 24, "4B5563")
         rect(s, 0, H - Inches(0.35), W, Inches(0.35), "111111")
 
+    if author:  # muallif ismi
+        acol = soft if style in ("classic", "side", "split", "gradient") else (
+            "4B5563" if style == "magazine" else txt)
+        text(s, Inches(AUTHOR_X[style]), Inches(6.4), Inches(7.5), Inches(0.5), author, 18, acol, True)
+    if logo:
+        add_logo(s, logo)
+
     # --------------------------- ASOSIY SLAYDLAR ---------------------------
     for i, sl in enumerate(slides, start=2):
         s = prs.slides.add_slide(blank)
         title = sl.get("title", "")
         num = i - 1
-        img = images[i - 2] if images and images[i - 2] else None
+        rich = sl.get("type") in ("chart", "table")
+        img = None if rich else (images[i - 2] if images and images[i - 2] else None)
         bullets = [b for b in sl.get("bullets", []) if b][:6] or [""]
         n = len(bullets)
         start = 20 if img else 22
@@ -862,15 +1544,18 @@ def build_pptx(data, theme_key, style, lang, path, images=None):
         if img:
             put_image(s, img, ix, iy, iw, ih, frame, accent)
 
-        common = dict(start=start, color=body, accent=accent)
-        if kind == "plain":
-            bullets_plain(s, bullets, **P, **common)
-        elif kind == "cards":
-            bullets_cards(s, bullets, card=card, **P, **common)
-        elif kind == "timeline":
-            bullets_timeline(s, bullets, **P, **common)
+        if rich:
+            draw_rich(s, sl, AREA[style], body, accent, dark, dark_now)
         else:
-            bullets_numbered(s, bullets, **P, **common)
+            common = dict(start=start, color=body, accent=accent)
+            if kind == "plain":
+                bullets_plain(s, bullets, **P, **common)
+            elif kind == "cards":
+                bullets_cards(s, bullets, card=card, **P, **common)
+            elif kind == "timeline":
+                bullets_timeline(s, bullets, **P, **common)
+            else:
+                bullets_numbered(s, bullets, **P, **common)
 
         text(s, Inches(pn_x), Inches(6.95), Inches(1.4), Inches(0.4), f"{i} / {total}", 12,
              "9CA3AF", align=pn_align)
@@ -910,21 +1595,176 @@ def build_pptx(data, theme_key, style, lang, path, images=None):
     prs.save(path)
 
 
-# =================================== HANDLERS ===================================
+# =================================== YORDAMCHILAR ===================================
+def is_admin(uid: int) -> bool:
+    return bool(ADMIN_ID) and uid == ADMIN_ID
+
+
+def safe_name(topic: str, ext: str = "pptx") -> str:
+    return (re.sub(r"[^\w\-]+", "_", topic)[:40] or "taqdimot") + "." + ext
+
+
+def rm(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+async def safe_edit(msg: Message, body: str, **kw):
+    try:
+        return await msg.edit_text(body, **kw)
+    except Exception:
+        return None
+
+
+def err_text(e: Exception) -> str:
+    msg = "😔 Xatolik bo'ldi. Qayta urinib ko'ring: /new"
+    if DEBUG:
+        msg += f"\n\n🐞 {type(e).__name__}: {str(e)[:300]}"
+    return msg
+
+
+async def render_file(content, theme, style, lang, uid, images) -> str:
+    """Taqdimotni .pptx fayl qilib yig'adi (muallif va logo bilan). Fayl yo'lini qaytaradi."""
+    author, logo = get_profile(uid)
+    fd, path = tempfile.mkstemp(suffix=".pptx")
+    os.close(fd)
+    try:
+        await asyncio.to_thread(build_pptx, content, theme, style, lang, path, images, author, logo)
+    except Exception:
+        rm(path)
+        raise
+    return path
+
+
+async def deck_images(deck, content):
+    """Saqlangan rasmlarni qaytaradi; yo'q bo'lsa (eski taqdimot) qaytadan qidiradi."""
+    if not deck["want_images"]:
+        return None
+    if deck["images"]:
+        try:
+            imgs = pickle.loads(deck["images"])
+            if imgs and len(imgs) == len(content["slides"]):
+                return imgs
+        except Exception:
+            pass
+    imgs = await fetch_all_images(content["slides"])
+    set_deck_images(deck["id"], imgs)
+    return imgs
+
+
+async def pptx_to_pdf(src: str):
+    exe = shutil.which("soffice") or shutil.which("libreoffice")
+    if not exe:
+        return None
+    outdir = tempfile.mkdtemp()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            exe, "--headless", "--convert-to", "pdf", "--outdir", outdir, src,
+            env=dict(os.environ, HOME=outdir),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=150)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return None
+        pdf = os.path.join(outdir, os.path.splitext(os.path.basename(src))[0] + ".pdf")
+        if not os.path.exists(pdf):
+            return None
+        fd, dst = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        shutil.move(pdf, dst)
+        return dst
+    finally:
+        shutil.rmtree(outdir, ignore_errors=True)
+
+
+async def send_style_picker(msg: Message, theme: str, prefix: str, caption: str):
+    """Barcha maketlarning namunasi (rasm) bilan tanlash tugmalarini yuboradi."""
+    kb = style_kb(prefix)
+    try:
+        png = await asyncio.to_thread(style_preview, theme)
+        await msg.answer_photo(BufferedInputFile(png, filename="maketlar.jpg"),
+                               caption=caption, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        log.warning("Maket namunasi chizilmadi: %s", e)
+        await msg.answer(caption, parse_mode="HTML", reply_markup=kb)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+async def send_deck(msg: Message, uid: int, did: int, note: str = "", theme=None, style=None):
+    """Saqlangan taqdimotni (kerak bo'lsa yangi rang/maket bilan) qayta yig'ib yuboradi."""
+    deck = get_deck(did, uid)
+    if not deck:
+        await msg.answer("😔 Taqdimot topilmadi.")
+        return
+    if uid in busy_users:
+        await msg.answer("⏳ Oldingi so'rov bajarilmoqda, kuting...")
+        return
+    busy_users.add(uid)
+    status = await msg.answer("🛠 Fayl tayyorlanmoqda...")
+    path = None
+    try:
+        content = json.loads(deck["content"])
+        theme, style = theme or deck["theme"], style or deck["style"]
+        async with gen_slot(status):
+            await safe_edit(status, "🛠 Fayl tayyorlanmoqda...")
+            images = await deck_images(deck, content)
+            path = await render_file(content, theme, style, deck["lang"], uid, images)
+        if (theme, style) != (deck["theme"], deck["style"]):
+            set_deck_design(did, theme, style)
+        await msg.answer_document(
+            FSInputFile(path, filename=safe_name(deck["topic"])),
+            caption=f"{note}\n🎯 Mavzu: {deck['topic']}\n🎨 {THEMES[theme][0]} · {STYLES[style]}".strip(),
+            reply_markup=deck_kb(did))
+        await status.delete()
+    except Exception as e:
+        log.exception("Taqdimotni yuborishda xato")
+        await safe_edit(status, err_text(e))
+    finally:
+        busy_users.discard(uid)
+        rm(path)
+
+
+# =================================== HANDLERLAR ===================================
 async def ask_topic(m: Message, state: FSMContext):
     await state.clear()
     await state.set_state(Form.topic)
     await m.answer(
         "👋 Salom! Men sizga professional taqdimot tayyorlab beraman.\n\n"
         "✍️ Taqdimot mavzusini yozing, masalan:\n"
-        "• <i>Global isish</i>\n• <i>Sun'iy intellekt kelajagi</i>\n• <i>Amir Temur</i>",
+        "• <i>Global isish</i>\n• <i>Sun'iy intellekt kelajagi</i>\n• <i>Amir Temur</i>\n\n"
+        "📄 Yoki <b>PDF / DOCX / TXT</b> fayl yuboring, men shu asosida taqdimot qilaman.",
         parse_mode="HTML", reply_markup=main_kb(),
     )
 
 
+# ---------- Buyruqlar (holat filtrisiz; ular state handlerlaridan oldin turishi shart) ----------
 @router.message(CommandStart())
+async def cmd_start(m: Message, state: FSMContext, command: CommandObject):
+    uid = m.from_user.id
+    arg = (command.args or "").strip()
+    if arg.startswith("ref_") and not user_exists(uid):
+        try:
+            ref = int(arg[4:])
+        except ValueError:
+            ref = 0
+        if ref and ref != uid and user_exists(ref):
+            ensure_user(uid, m.from_user.full_name)
+            set_referrer(uid, ref)
+            await m.answer("🎁 Do'stingiz taklifi bilan keldingiz! Birinchi taqdimotingiz tayyor bo'lgach, "
+                           "u ham sovg'a oladi.")
+    ensure_user(uid, m.from_user.full_name)
+    await ask_topic(m, state)
+
+
 @router.message(Command("new"))
-async def cmd_start(m: Message, state: FSMContext):
+async def cmd_new(m: Message, state: FSMContext):
     await ask_topic(m, state)
 
 
@@ -945,17 +1785,178 @@ async def cmd_skip(m: Message, state: FSMContext):
 async def cmd_help(m: Message):
     await m.answer(
         "ℹ️ <b>Qanday ishlaydi?</b>\n"
-        "1️⃣ Mavzuni yozasiz\n2️⃣ Slayd sonini tanlaysiz\n3️⃣ Tilni tanlaysiz\n"
-        "4️⃣ Rangni tanlaysiz\n5️⃣ Maketni tanlaysiz\n6️⃣ Rasm kerakmi — tanlaysiz\n"
-        "7️⃣ Tayyor .pptx faylni olasiz\n\n"
-        "/new — yangi taqdimot\n/cancel — bekor qilish",
+        "1️⃣ Mavzuni yozasiz (yoki PDF/DOCX/TXT fayl yuborasiz)\n"
+        "2️⃣ Slayd soni, til, rang va maketni tanlaysiz (maket namunalari ko'rsatiladi)\n"
+        "3️⃣ Rasm kerakmi — tanlaysiz\n"
+        "4️⃣ Tayyor <b>rejani</b> ko'rib tasdiqlaysiz\n"
+        "5️⃣ .pptx faylni olasiz, so'ng uni tahrirlash, dizaynini almashtirish yoki PDF qilish mumkin\n\n"
+        "/new — yangi taqdimot\n/history — oldingi taqdimotlar\n/balance — balans\n"
+        "/invite — do'st taklif qilib bonus olish\n/settings — muallif ismi va logo\n/cancel — bekor qilish",
         parse_mode="HTML",
     )
 
 
+@router.message(Command("balance"))
+async def cmd_balance(m: Message):
+    n = get_credits(m.from_user.id, m.from_user.full_name)
+    if is_admin(m.from_user.id):
+        await m.answer("👑 Siz adminsiz: cheksiz.")
+    else:
+        await m.answer(f"💎 Sizda <b>{n}</b> ta taqdimot qoldi.\n\n"
+                       "➕ Balansni to'ldirish uchun paketni tanlang:",
+                       parse_mode="HTML", reply_markup=packs_kb())
+
+
+@router.message(Command("history"))
+async def cmd_history(m: Message):
+    rows = list_decks(m.from_user.id)
+    if not rows:
+        await m.answer("🗂 Hozircha taqdimotlaringiz yo'q. Boshlash: /new")
+        return
+    kb = InlineKeyboardBuilder()
+    for r in rows:
+        when = time.strftime("%d.%m", time.localtime(r["ts"]))
+        kb.button(text=f"📊 {(r['topic'] or '')[:28]} · {when}", callback_data=f"hist:{r['id']}")
+    kb.adjust(1)
+    await m.answer(f"🗂 <b>Oxirgi {len(rows)} ta taqdimotingiz</b>\nTanlang, men faylni qayta yuboraman "
+                   "(tahrirlash ham mumkin):", parse_mode="HTML", reply_markup=kb.as_markup())
+
+
+@router.message(Command("invite"))
+async def cmd_invite(m: Message):
+    uid = m.from_user.id
+    a, b = ref_stats(uid)
+    link = f"https://t.me/{BOT_USERNAME}?start=ref_{uid}"
+    await m.answer(
+        "🎁 <b>Do'st taklif qiling — bepul taqdimot oling!</b>\n\n"
+        f"Sizning havolangiz:\n{link}\n\n"
+        f"Do'stingiz birinchi taqdimotini yaratganda sizga <b>+{REF_BONUS}</b> ta taqdimot beriladi "
+        f"(maksimum {REF_MAX} ta do'st uchun).\n\n"
+        f"👥 Taklif qilinganlar: {a}\n🎉 Bonus olingan: {b}",
+        parse_mode="HTML", disable_web_page_preview=True)
+
+
+async def show_settings(m: Message, uid: int):
+    author, logo = get_profile(uid)
+    await m.answer(
+        "⚙️ <b>Sozlamalar</b>\n\n"
+        f"👤 Muallif: <b>{html.escape(author) if author else 'kiritilmagan'}</b>\n"
+        f"🖼 Logo: <b>{'yuklangan' if logo else 'yo`q'}</b>\n\n"
+        "Muallif ismi va logo taqdimotning birinchi (titul) slaydida chiqadi.",
+        parse_mode="HTML", reply_markup=settings_kb(bool(author), bool(logo)))
+
+
+@router.message(Command("settings"))
+async def cmd_settings(m: Message):
+    await show_settings(m, m.from_user.id)
+
+
+@router.message(Command("author"))
+async def cmd_author(m: Message, state: FSMContext, command: CommandObject):
+    name = (command.args or "").strip()
+    if name:
+        set_author(m.from_user.id, name[:60])
+        await m.answer(f"✅ Muallif: {name[:60]}")
+    else:
+        await state.set_state(Form.author)
+        await m.answer("👤 Muallif ismini yozing (masalan: Aziz Karimov).\nBekor qilish: /cancel")
+
+
+@router.message(Command("logo"))
+async def cmd_logo(m: Message, state: FSMContext):
+    await state.set_state(Form.logo)
+    await m.answer("🖼 Logo rasmini yuboring (PNG tavsiya etiladi, fon shaffof bo'lsa yaxshi).\n"
+                   "Bekor qilish: /cancel")
+
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    await state.set_state(Form.broadcast)
+    await m.answer("📣 Hammaga yuboriladigan xabarni yuboring (matn, rasm, video — farqi yo'q).\n"
+                   "Bekor qilish: /cancel")
+
+
+@router.message(Command("stats"))
+async def cmd_stats(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    now = int(time.time())
+    with closing(db()) as c:
+        users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        new24 = c.execute("SELECT COUNT(*) FROM users WHERE created>=?", (now - 86400,)).fetchone()[0]
+        made = c.execute("SELECT COALESCE(SUM(made),0) FROM users").fetchone()[0]
+        edits = c.execute("SELECT COALESCE(SUM(edits),0) FROM decks").fetchone()[0]
+        refs = c.execute("SELECT COUNT(*), COALESCE(SUM(ref_paid),0) FROM users "
+                         "WHERE referrer IS NOT NULL").fetchone()
+        stars = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payments "
+                          "WHERE kind='stars'").fetchone()
+        card = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payments "
+                         "WHERE kind='card' AND status='approved'").fetchone()
+        pend = c.execute("SELECT COUNT(*) FROM payments WHERE status='pending'").fetchone()[0]
+        fb = c.execute("SELECT COUNT(score), COALESCE(AVG(score),0) FROM feedback "
+                       "WHERE score IS NOT NULL").fetchone()
+        by_style = c.execute("SELECT style, COUNT(score) n, AVG(score) a FROM feedback "
+                             "WHERE score IS NOT NULL GROUP BY style ORDER BY a DESC").fetchall()
+    lines = [f"  {STYLES.get(r['style'], r['style'])}: {r['a']:.1f} ⭐️ ({r['n']} ta)" for r in by_style]
+    await m.answer(
+        f"📈 <b>Statistika</b>\n👥 Foydalanuvchilar: {users} (24 soatda +{new24})\n"
+        f"📊 Yaratilgan taqdimotlar: {made}\n✏️ Tahrirlar: {edits}\n"
+        f"🎁 Referallar: {refs[0]} ta (bonus berilgan: {refs[1]})\n"
+        f"⭐️ Stars: {stars[0]} ta, jami {stars[1]} ⭐️\n"
+        f"💳 Karta: {card[0]} ta, jami {som(card[1])} so'm\n⏳ Kutilayotgan: {pend}\n\n"
+        f"💬 Baholar: {fb[0]} ta, o'rtacha {fb[1]:.1f}/5"
+        + ("\n🎨 Maketlar bo'yicha:\n" + "\n".join(lines) if lines else ""),
+        parse_mode="HTML")
+
+
+@router.message(Command("give"))
+async def cmd_give(m: Message):
+    """Admin: /give <user_id> <son>  - qo'lda limit berish"""
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        _, uid, n = m.text.split()
+        add_credits(int(uid), int(n))
+        await m.answer(f"✅ {uid} ga +{n} ta berildi. Jami: {get_credits(int(uid))}")
+    except Exception:
+        await m.answer("Format: /give 123456789 5")
+
+
+@router.message(Command("user"))
+async def cmd_user(m: Message):
+    """Admin: /user <user_id> - foydalanuvchi haqida ma'lumot"""
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        uid = int(m.text.split()[1])
+    except (IndexError, ValueError):
+        await m.answer("Format: /user 123456789")
+        return
+    with closing(db()) as c:
+        r = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+        nd = c.execute("SELECT COUNT(*) FROM decks WHERE user_id=?", (uid,)).fetchone()[0]
+    if not r:
+        await m.answer("Topilmadi.")
+        return
+    a, b = ref_stats(uid)
+    await m.answer(
+        f"👤 {html.escape(r['name'] or '')} (id {uid})\n💎 Limit: {r['credits']}\n"
+        f"📊 Yaratgan: {r['made']}\n🗂 Tarixda: {nd}\n🎁 Taklif qilgan: {a} (bonus: {b})\n"
+        f"👥 Taklif qilgan odam: {r['referrer'] or '-'}\n✍️ Muallif: {html.escape(r['author'] or '-')}",
+        parse_mode="HTML")
+
+
+# ---------- Pastki menyu tugmalari ----------
 @router.message(F.text == BTN_NEW)
 async def btn_new(m: Message, state: FSMContext):
     await ask_topic(m, state)
+
+
+@router.message(F.text == BTN_HIST)
+async def btn_hist(m: Message):
+    await cmd_history(m)
 
 
 @router.message(F.text == BTN_BAL)
@@ -969,6 +1970,16 @@ async def btn_buy(m: Message):
                    parse_mode="HTML", reply_markup=packs_kb())
 
 
+@router.message(F.text == BTN_REF)
+async def btn_ref(m: Message):
+    await cmd_invite(m)
+
+
+@router.message(F.text == BTN_SET)
+async def btn_set(m: Message):
+    await show_settings(m, m.from_user.id)
+
+
 @router.message(F.text == BTN_HELP)
 async def btn_help(m: Message):
     await cmd_help(m)
@@ -977,7 +1988,8 @@ async def btn_help(m: Message):
 async def show_paywall(m: Message):
     await m.answer(
         "😔 <b>Bepul limitingiz tugadi.</b>\n\n"
-        "➕ Davom etish uchun balansni to'ldiring, paketni tanlang:",
+        "➕ Davom etish uchun balansni to'ldiring yoki do'stlaringizni taklif qiling (/invite).\n"
+        "Paketni tanlang:",
         parse_mode="HTML", reply_markup=packs_kb())
 
 
@@ -990,16 +2002,12 @@ async def take_topic(m: Message, state: FSMContext):
     if len(topic) < 3 or len(topic) > 200:
         await m.answer("⚠️ Mavzu 3 dan 200 belgigacha bo'lishi kerak. Qayta yozing.")
         return
-    await state.update_data(topic=topic)
+    await state.set_data({"topic": topic})  # eski fayl matni va tanlovlar tozalanadi
     await m.answer(f"📝 Mavzu: <b>{html.escape(topic)}</b>\n\n📊 Nechta slayd kerak?",
                    parse_mode="HTML", reply_markup=count_kb())
 
 
-@router.message(Form.topic, F.text, ~F.text.startswith("/"))
-async def got_topic(m: Message, state: FSMContext):
-    await take_topic(m, state)
-
-
+# ---------- Tanlov bosqichlari ----------
 @router.callback_query(F.data.startswith("count:"))
 async def got_count(c: CallbackQuery, state: FSMContext):
     if "topic" not in await state.get_data():
@@ -1018,6 +2026,9 @@ async def got_lang(c: CallbackQuery, state: FSMContext):
         await c.answer("Avval /new ni bosing", show_alert=True)
         return
     lang = c.data.split(":")[1]
+    if lang not in LANGS:
+        await c.answer("Noma'lum til", show_alert=True)
+        return
     await state.update_data(lang=lang)
     await c.message.edit_text(f"🌐 Til: <b>{LANGS[lang][0]}</b>\n\n🎨 Rangni tanlang:",
                               parse_mode="HTML", reply_markup=theme_kb())
@@ -1030,11 +2041,14 @@ async def got_theme(c: CallbackQuery, state: FSMContext):
         await c.answer("Avval /new ni bosing", show_alert=True)
         return
     theme = c.data.split(":")[1]
+    if theme not in THEMES:
+        await c.answer("Noma'lum rang", show_alert=True)
+        return
     await state.update_data(theme=theme)
-    await c.message.edit_text(
-        f"🎨 Rang: <b>{THEMES[theme][0]}</b>\n\n📐 Slayd maketini tanlang:",
-        parse_mode="HTML", reply_markup=style_kb())
     await c.answer()
+    await send_style_picker(
+        c.message, theme, "style:",
+        f"🎨 Rang: <b>{THEMES[theme][0]}</b>\n\n📐 Slayd maketini tanlang (namunalar rasmda):")
 
 
 @router.callback_query(F.data.startswith("style:"))
@@ -1047,10 +2061,48 @@ async def got_style(c: CallbackQuery, state: FSMContext):
         await c.answer("Noma'lum maket", show_alert=True)
         return
     await state.update_data(style=style)
-    await c.message.edit_text(
+    await c.message.answer(
         f"📐 Maket: <b>{STYLES[style]}</b>\n\n🖼 Slaydlarga rasm qo'shilsinmi?",
         parse_mode="HTML", reply_markup=images_kb())
+    try:
+        await c.message.delete()
+    except Exception:
+        pass
     await c.answer()
+
+
+# ---------- Reja ----------
+ICONS = {"chart": "📊 ", "table": "🧮 "}
+
+
+async def show_plan(msg: Message, content: dict, regen: int):
+    lines = [f"{i}. {ICONS.get(sl['type'], '')}{html.escape(sl['title'])}"
+             for i, sl in enumerate(content["slides"], start=1)]
+    body = (f"📋 <b>{html.escape(content.get('title', ''))}</b>\n"
+            f"<i>{html.escape(content.get('subtitle', ''))}</i>\n\n" + "\n".join(lines) +
+            "\n\nReja ma'qulmi? Ma'qul bo'lsa, faylni yig'amiz.")
+    await msg.edit_text(body, parse_mode="HTML", reply_markup=plan_kb(regen))
+
+
+async def make_plan(c: CallbackQuery, state: FSMContext, d: dict, regen: int):
+    """Reja yaratadi (yoki qayta yaratadi) va tasdiqlash uchun ko'rsatadi."""
+    uid = c.from_user.id
+    busy_users.add(uid)
+    status = await c.message.edit_text(
+        f"⏳ <b>{html.escape(d['topic'])}</b> bo'yicha reja tayyorlanmoqda...", parse_mode="HTML")
+    try:
+        async with gen_slot(status):
+            await safe_edit(status, f"⏳ <b>{html.escape(d['topic'])}</b> bo'yicha reja tayyorlanmoqda...",
+                            parse_mode="HTML")
+            content = await generate_content(d["topic"], d["count"], d["lang"], d.get("source", ""))
+        await state.update_data(content=content, regen=regen)
+        await show_plan(status, content, regen)
+    except Exception as e:
+        log.exception("Reja xatosi")
+        await safe_edit(status, err_text(e))
+        await state.clear()
+    finally:
+        busy_users.discard(uid)
 
 
 @router.callback_query(F.data.startswith("img:"))
@@ -1061,54 +2113,99 @@ async def got_images(c: CallbackQuery, state: FSMContext):
         await c.answer("Avval /new ni bosing", show_alert=True)
         return
     if uid in busy_users:
-        await c.answer("⏳ Oldingi taqdimot tayyorlanmoqda, kuting...", show_alert=True)
+        await c.answer("⏳ Oldingi so'rov bajarilmoqda, kuting...", show_alert=True)
         return
+    if get_credits(uid, c.from_user.full_name) <= 0:
+        await c.answer()
+        await state.clear()
+        await show_paywall(c.message)
+        return
+    await state.update_data(want_images=c.data.endswith("yes"))
+    await c.answer()
+    await make_plan(c, state, d, 0)
 
+
+@router.callback_query(F.data == "plan:redo")
+async def plan_redo(c: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    if not all(k in d for k in ("topic", "count", "lang", "content")):
+        await c.answer("Reja topilmadi. /new ni bosing", show_alert=True)
+        return
+    regen = d.get("regen", 0) + 1
+    if regen > 2:
+        await c.answer("Boshqa reja limiti tugadi", show_alert=True)
+        return
+    if c.from_user.id in busy_users:
+        await c.answer("⏳ Kuting...", show_alert=True)
+        return
+    await c.answer()
+    await make_plan(c, state, d, regen)
+
+
+@router.callback_query(F.data == "plan:no")
+async def plan_no(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.message.edit_text("❌ Bekor qilindi. Yangi taqdimot uchun /new ni bosing.")
+    await c.answer()
+
+
+@router.callback_query(F.data == "plan:ok")
+async def plan_ok(c: CallbackQuery, state: FSMContext):
+    uid = c.from_user.id
+    d = await state.get_data()
+    if not all(k in d for k in ("topic", "count", "lang", "theme", "style", "content")):
+        await c.answer("Reja topilmadi. /new ni bosing", show_alert=True)
+        return
+    if uid in busy_users:
+        await c.answer("⏳ Oldingi so'rov bajarilmoqda, kuting...", show_alert=True)
+        return
     if get_credits(uid, c.from_user.full_name) <= 0:
         await c.answer()
         await state.clear()
         await show_paywall(c.message)
         return
 
-    want_images = c.data.endswith("yes")
     topic, count, lang, theme, style = d["topic"], d["count"], d["lang"], d["theme"], d["style"]
+    content, want_images = d["content"], bool(d.get("want_images"))
     if style == "random":
         style = random.choice(STYLE_KEYS)
     busy_users.add(uid)
     await c.answer()
     status = await c.message.edit_text(
-        f"⏳ <b>{html.escape(topic)}</b> bo'yicha {count} slaydli taqdimot tayyorlanmoqda...\n"
-        "Bu 20-90 soniya olishi mumkin.", parse_mode="HTML")
+        f"⏳ <b>{html.escape(topic)}</b> taqdimoti yig'ilmoqda...", parse_mode="HTML")
 
     path = None
     try:
-        content = await generate_content(topic, count, lang)
+        async with gen_slot(status):
+            images = None
+            if want_images:
+                await safe_edit(status, "🖼 Rasmlar qidirilmoqda...")
+                images = await fetch_all_images(content["slides"])
+            found = sum(1 for x in (images or []) if x)
+            await safe_edit(status, "🛠 Fayl yig'ilmoqda...")
+            path = await render_file(content, theme, style, lang, uid, images)
 
-        images = None
-        if want_images:
-            await status.edit_text("🖼 Rasmlar qidirilmoqda...")
-            images = await fetch_all_images(content["slides"])
-        found = sum(1 for x in (images or []) if x)
-
-        await status.edit_text("🛠 Fayl yig'ilmoqda...")
-        fd, path = tempfile.mkstemp(suffix=".pptx")
-        os.close(fd)
-        await asyncio.to_thread(build_pptx, content, theme, style, lang, path, images)
-
-        safe = re.sub(r"[^\w\-]+", "_", topic)[:40] or "taqdimot"
+        did = save_deck(uid, topic, content, theme, style, lang, want_images, images)
         extra = f"\n🎨 {THEMES[theme][0]} · {STYLES[style]}"
         if want_images:
             extra += f"\n🖼 Rasmlar: {found} ta"
-        if uid != ADMIN_ID:
+        if not is_admin(uid):
             extra += f"\n💎 Qolgan limit: {max(get_credits(uid) - 1, 0)} ta"
         await c.message.answer_document(
-            FSInputFile(path, filename=f"{safe}.pptx"),
+            FSInputFile(path, filename=safe_name(topic)),
             caption=(f"✅ Tayyor! 📊 {count} slayd\n🎯 Mavzu: {topic}{extra}\n"
                      "🗣 Har slaydda ma'ruzachi uchun izohlar (Notes) bor.\n\n"
-                     "Yangi taqdimot: /new"),
-            reply_markup=main_kb(),
+                     "Pastdagi tugmalar bilan tahrirlash, dizaynni almashtirish yoki PDF olish mumkin."),
+            reply_markup=deck_kb(did),
         )
-        consume(uid)  # limit faqat muvaffaqiyatli yuborilgandan keyin kamayadi
+        ref = consume(uid)  # limit faqat muvaffaqiyatli yuborilgandan keyin kamayadi
+        if ref:
+            try:
+                await c.bot.send_message(
+                    ref, f"🎁 Do'stingiz taklifingiz bilan birinchi taqdimotini yaratdi! "
+                         f"+{REF_BONUS} ta taqdimot sovg'a.\n💎 Jami: {get_credits(ref)} ta")
+            except Exception as e:
+                log.warning("Referalga xabar ketmadi: %s", e)
 
         # Har 10 ta taqdimotdan ~3 tasidan keyin fikr so'raymiz
         if random.random() < FEEDBACK_RATE:
@@ -1122,15 +2219,391 @@ async def got_images(c: CallbackQuery, state: FSMContext):
         await status.delete()
     except Exception as e:
         log.exception("Generatsiya xatosi")
-        msg = "😔 Xatolik bo'ldi. Qayta urinib ko'ring: /new"
-        if DEBUG:
-            msg += f"\n\n🐞 {type(e).__name__}: {str(e)[:300]}"
-        await status.edit_text(msg)
+        await safe_edit(status, err_text(e))
     finally:
         busy_users.discard(uid)
         await state.clear()
-        if path and os.path.exists(path):
-            os.remove(path)
+        rm(path)
+
+
+# ---------- Fayldan taqdimot ----------
+@router.message(F.document)
+async def got_document(m: Message, state: FSMContext):
+    doc = m.document
+    name = doc.file_name or "fayl"
+    ext = name.lower().rsplit(".", 1)[-1] if "." in name else ""
+    if ext not in ("pdf", "docx", "txt", "md"):
+        await m.answer("📄 Faqat PDF, DOCX yoki TXT fayl yuboring. Yoki mavzuni yozing.")
+        return
+    if (doc.file_size or 0) > 10 * 1024 * 1024:
+        await m.answer("⚠️ Fayl katta (10 MB gacha bo'lsin).")
+        return
+    if get_credits(m.from_user.id, m.from_user.full_name) <= 0:
+        await state.clear()
+        await show_paywall(m)
+        return
+    wait = await m.answer("📥 Fayl o'qilmoqda...")
+    fd, path = tempfile.mkstemp(suffix="." + ext)
+    os.close(fd)
+    try:
+        await m.bot.download(doc, destination=path)
+        src = await asyncio.to_thread(extract_text, path, ext)
+    except Exception as e:
+        log.warning("Faylni o'qib bo'lmadi: %s", e)
+        await safe_edit(wait, "😔 Faylni o'qib bo'lmadi. Boshqa fayl yuboring yoki mavzuni yozing.")
+        return
+    finally:
+        rm(path)
+    if len(src) < 200:
+        await safe_edit(wait, "⚠️ Fayldan yetarli matn topilmadi (skaner qilingan PDF bo'lishi mumkin). "
+                              "Boshqa fayl yuboring yoki mavzuni yozing.")
+        return
+    topic = ((m.caption or "").strip() or name.rsplit(".", 1)[0].replace("_", " "))[:200]
+    if len(topic) < 3:
+        topic = "Hujjat asosida taqdimot"
+    await state.set_data({"topic": topic, "source": src})
+    await safe_edit(wait, f"📄 Fayl o'qildi: <b>{html.escape(name)}</b> ({len(src)} belgi)\n"
+                          f"📝 Mavzu: <b>{html.escape(topic)}</b>\n\n📊 Nechta slayd kerak?",
+                    parse_mode="HTML", reply_markup=count_kb())
+
+
+# ---------- Tarix ----------
+@router.callback_query(F.data.startswith("hist:"))
+async def hist_open(c: CallbackQuery):
+    await c.answer()
+    await send_deck(c.message, c.from_user.id, int(c.data.split(":")[1]))
+
+
+# ---------- Tahrirlash ----------
+def edits_left(deck, uid: int) -> str:
+    return "∞" if is_admin(uid) else str(max(EDIT_LIMIT - deck["edits"], 0))
+
+
+@router.callback_query(F.data.startswith("ed:menu:"))
+async def ed_menu(c: CallbackQuery):
+    did = int(c.data.split(":")[2])
+    deck = get_deck(did, c.from_user.id)
+    if not deck:
+        await c.answer("Taqdimot topilmadi", show_alert=True)
+        return
+    content = json.loads(deck["content"])
+    kb = InlineKeyboardBuilder()
+    for i, sl in enumerate(content["slides"]):
+        kb.button(text=f"{i + 1}. {sl['title'][:20]}", callback_data=f"ed:s:{did}:{i}")
+    kb.adjust(2)
+    body = f"✏️ Qaysi slaydni tahrirlaymiz?\nQolgan tahrirlar: {edits_left(deck, c.from_user.id)}"
+    if c.message.document:  # fayl xabaridan chaqirilsa - yangi xabar
+        await c.message.answer(body, reply_markup=kb.as_markup())
+    else:
+        await c.message.edit_text(body, reply_markup=kb.as_markup())
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("ed:s:"))
+async def ed_slide_menu(c: CallbackQuery):
+    _, _, did, idx = c.data.split(":")
+    deck = get_deck(int(did), c.from_user.id)
+    if not deck:
+        await c.answer("Taqdimot topilmadi", show_alert=True)
+        return
+    content = json.loads(deck["content"])
+    idx = int(idx)
+    if not 0 <= idx < len(content["slides"]):
+        await c.answer("Slayd topilmadi", show_alert=True)
+        return
+    kb = InlineKeyboardBuilder()
+    for key, (label, _) in EDIT_ACTIONS.items():
+        kb.button(text=label, callback_data=f"ed:a:{did}:{idx}:{key}")
+    kb.button(text="🖊 O'z ko'rsatmam bor", callback_data=f"ed:c:{did}:{idx}")
+    kb.button(text="⬅️ Orqaga", callback_data=f"ed:menu:{did}")
+    kb.adjust(1)
+    await c.message.edit_text(
+        f"✏️ <b>{idx + 1}-slayd:</b> {html.escape(content['slides'][idx]['title'])}\n"
+        "Nima qilamiz?", parse_mode="HTML", reply_markup=kb.as_markup())
+    await c.answer()
+
+
+async def run_edit(msg: Message, uid: int, did: int, idx: int, instruction: str):
+    deck = get_deck(did, uid)
+    if not deck:
+        await msg.answer("😔 Taqdimot topilmadi.")
+        return
+    content = json.loads(deck["content"])
+    if not 0 <= idx < len(content["slides"]):
+        await msg.answer("😔 Slayd topilmadi.")
+        return
+    if not is_admin(uid) and deck["edits"] >= EDIT_LIMIT:
+        await msg.answer(f"⚠️ Bu taqdimot uchun tahrir limiti ({EDIT_LIMIT} ta) tugadi. "
+                         "Yangi taqdimot yaratishingiz mumkin: /new")
+        return
+    if uid in busy_users:
+        await msg.answer("⏳ Oldingi so'rov bajarilmoqda, kuting...")
+        return
+    busy_users.add(uid)
+    status = await msg.answer("✏️ Slayd yangilanmoqda...")
+    path = None
+    try:
+        async with gen_slot(status):
+            await safe_edit(status, "✏️ Slayd yangilanmoqda...")
+            new = await edit_slide(deck["topic"], deck["lang"], content["slides"][idx], instruction)
+            content["slides"][idx] = new
+            images = await deck_images(deck, content)
+            if (deck["want_images"] and images and new["type"] == "bullets"
+                    and images[idx] is None and new.get("image_query")):
+                images[idx] = (await fetch_all_images([new]))[0]
+            path = await render_file(content, deck["theme"], deck["style"], deck["lang"], uid, images)
+        update_deck(did, content, images, deck["edits"] + 1)
+        left = "∞" if is_admin(uid) else str(max(EDIT_LIMIT - deck["edits"] - 1, 0))
+        await msg.answer_document(
+            FSInputFile(path, filename=safe_name(deck["topic"])),
+            caption=f"✅ {idx + 1}-slayd yangilandi.\n✏️ Qolgan tahrirlar: {left}",
+            reply_markup=deck_kb(did))
+        await status.delete()
+    except Exception as e:
+        log.exception("Tahrirlash xatosi")
+        await safe_edit(status, err_text(e))
+    finally:
+        busy_users.discard(uid)
+        rm(path)
+
+
+@router.callback_query(F.data.startswith("ed:a:"))
+async def ed_action(c: CallbackQuery):
+    _, _, did, idx, key = c.data.split(":")
+    if key not in EDIT_ACTIONS:
+        await c.answer("Noma'lum amal", show_alert=True)
+        return
+    await c.answer()
+    await run_edit(c.message, c.from_user.id, int(did), int(idx), EDIT_ACTIONS[key][1])
+
+
+@router.callback_query(F.data.startswith("ed:c:"))
+async def ed_custom(c: CallbackQuery, state: FSMContext):
+    _, _, did, idx = c.data.split(":")
+    if not get_deck(int(did), c.from_user.id):
+        await c.answer("Taqdimot topilmadi", show_alert=True)
+        return
+    await state.set_state(Form.edit_text)
+    await state.set_data({"ed_did": int(did), "ed_idx": int(idx)})
+    await c.message.answer(f"🖊 {int(idx) + 1}-slayd uchun ko'rsatmangizni yozing "
+                           "(masalan: <i>Iqtisodiy ta'sirga e'tibor ber</i>).\nBekor qilish: /cancel",
+                           parse_mode="HTML")
+    await c.answer()
+
+
+@router.message(Form.edit_text, F.text)
+async def got_edit_text(m: Message, state: FSMContext):
+    d = await state.get_data()
+    await state.clear()
+    if "ed_did" not in d:
+        return
+    instr = (m.text or "").strip()[:300]
+    await run_edit(m, m.from_user.id, d["ed_did"], d["ed_idx"],
+                   f"Follow this user instruction for the slide: {instr}")
+
+
+# ---------- Dizaynni almashtirish ----------
+@router.callback_query(F.data.startswith("rd:menu:"))
+async def rd_menu(c: CallbackQuery):
+    did = int(c.data.split(":")[2])
+    if not get_deck(did, c.from_user.id):
+        await c.answer("Taqdimot topilmadi", show_alert=True)
+        return
+    await c.message.answer("🎨 Yangi rangni tanlang (matn o'zgarmaydi, bepul):",
+                           reply_markup=theme_kb(f"rd:t:{did}:"))
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("rd:t:"))
+async def rd_theme(c: CallbackQuery):
+    _, _, did, theme = c.data.split(":")
+    if theme not in THEMES:
+        await c.answer("Noma'lum rang", show_alert=True)
+        return
+    await c.answer()
+    await send_style_picker(c.message, theme, f"rd:s:{did}:{theme}:",
+                            f"🎨 Rang: <b>{THEMES[theme][0]}</b>\n\n📐 Yangi maketni tanlang:")
+
+
+@router.callback_query(F.data.startswith("rd:s:"))
+async def rd_style(c: CallbackQuery):
+    _, _, did, theme, style = c.data.split(":")
+    if theme not in THEMES or style not in STYLES:
+        await c.answer("Noma'lum tanlov", show_alert=True)
+        return
+    if style == "random":
+        style = random.choice(STYLE_KEYS)
+    await c.answer()
+    try:
+        await c.message.delete()
+    except Exception:
+        pass
+    await send_deck(c.message, c.from_user.id, int(did), note="🎨 Dizayn almashtirildi.",
+                    theme=theme, style=style)
+
+
+# ---------- PDF ----------
+@router.callback_query(F.data.startswith("pdf:"))
+async def make_pdf(c: CallbackQuery):
+    uid = c.from_user.id
+    if not PDF_OK:
+        await c.answer("PDF hozircha mavjud emas", show_alert=True)
+        return
+    deck = get_deck(int(c.data.split(":")[1]), uid)
+    if not deck:
+        await c.answer("Taqdimot topilmadi", show_alert=True)
+        return
+    if uid in busy_users:
+        await c.answer("⏳ Oldingi so'rov bajarilmoqda, kuting...", show_alert=True)
+        return
+    busy_users.add(uid)
+    await c.answer()
+    status = await c.message.answer("📄 PDF tayyorlanmoqda (30-60 soniya)...")
+    pptx_path = pdf_path = None
+    try:
+        content = json.loads(deck["content"])
+        async with gen_slot(status):
+            await safe_edit(status, "📄 PDF tayyorlanmoqda (30-60 soniya)...")
+            images = await deck_images(deck, content)
+            pptx_path = await render_file(content, deck["theme"], deck["style"], deck["lang"], uid, images)
+            async with pdf_sem:
+                pdf_path = await pptx_to_pdf(pptx_path)
+        if not pdf_path:
+            raise RuntimeError("PDF yaratib bo'lmadi")
+        await c.message.answer_document(
+            FSInputFile(pdf_path, filename=safe_name(deck["topic"], "pdf")), caption="📄 PDF tayyor!")
+        await status.delete()
+    except Exception as e:
+        log.exception("PDF xatosi")
+        await safe_edit(status, err_text(e))
+    finally:
+        busy_users.discard(uid)
+        rm(pptx_path)
+        rm(pdf_path)
+
+
+# ---------- Sozlamalar: muallif va logo ----------
+@router.callback_query(F.data == "set:author")
+async def set_author_cb(c: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.author)
+    await c.message.answer("👤 Muallif ismini yozing (masalan: Aziz Karimov).\nBekor qilish: /cancel")
+    await c.answer()
+
+
+@router.callback_query(F.data == "set:logo")
+async def set_logo_cb(c: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.logo)
+    await c.message.answer("🖼 Logo rasmini yuboring (PNG tavsiya etiladi).\nBekor qilish: /cancel")
+    await c.answer()
+
+
+@router.callback_query(F.data == "set:author_off")
+async def set_author_off(c: CallbackQuery):
+    set_author(c.from_user.id, "")
+    await c.answer("Muallif o'chirildi")
+    await c.message.delete()
+
+
+@router.callback_query(F.data == "set:logo_off")
+async def set_logo_off(c: CallbackQuery):
+    set_logo(c.from_user.id, None)
+    await c.answer("Logo o'chirildi")
+    await c.message.delete()
+
+
+@router.message(Form.author, F.text)
+async def got_author(m: Message, state: FSMContext):
+    name = (m.text or "").strip()[:60]
+    if len(name) < 2:
+        await m.answer("⚠️ Ism juda qisqa. Qayta yozing yoki /cancel.")
+        return
+    set_author(m.from_user.id, name)
+    await state.clear()
+    await m.answer(f"✅ Muallif saqlandi: <b>{html.escape(name)}</b>\nEndi titul slaydda chiqadi.",
+                   parse_mode="HTML", reply_markup=main_kb())
+
+
+@router.message(Form.logo, F.photo | F.document)
+async def got_logo(m: Message, state: FSMContext):
+    obj = m.photo[-1] if m.photo else m.document
+    if not m.photo and not (m.document.mime_type or "").startswith("image/"):
+        await m.answer("📸 Iltimos, rasm (PNG/JPG) yuboring yoki /cancel bosing.")
+        return
+    if (getattr(obj, "file_size", 0) or 0) > 8 * 1024 * 1024:
+        await m.answer("⚠️ Rasm katta (8 MB gacha bo'lsin).")
+        return
+    try:
+        buf = await m.bot.download(obj)
+        data = await asyncio.to_thread(prep_logo, buf.read())
+    except Exception as e:
+        log.warning("Logo o'qilmadi: %s", e)
+        await m.answer("😔 Rasmni o'qib bo'lmadi. Boshqa rasm yuboring.")
+        return
+    set_logo(m.from_user.id, data)
+    await state.clear()
+    await m.answer("✅ Logo saqlandi. Endi titul slaydda chiqadi.", reply_markup=main_kb())
+
+
+@router.message(Form.logo)
+async def logo_not_image(m: Message):
+    await m.answer("📸 Iltimos, logo <b>rasmini</b> yuboring yoki /cancel bosing.", parse_mode="HTML")
+
+
+# ---------- Broadcast (admin) ----------
+@router.message(Form.broadcast)
+async def bc_preview(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear()
+        return
+    await state.set_data({"bc_chat": m.chat.id, "bc_msg": m.message_id})
+    with closing(db()) as c:
+        n = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    await m.bot.copy_message(m.chat.id, m.chat.id, m.message_id)  # ko'rinishi
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"✅ Yuborish ({n} ta)", callback_data="bc:yes")
+    kb.button(text="❌ Bekor", callback_data="bc:no")
+    kb.adjust(2)
+    await m.answer("👆 Shu xabar barcha foydalanuvchilarga yuboriladi. Tasdiqlaysizmi?",
+                   reply_markup=kb.as_markup())
+
+
+async def do_broadcast(bot: Bot, src_chat: int, src_msg: int, admin_chat: int):
+    with closing(db()) as c:
+        ids = [r[0] for r in c.execute("SELECT user_id FROM users")]
+    ok = fail = 0
+    for uid in ids:
+        try:
+            await bot.copy_message(uid, src_chat, src_msg)
+            ok += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                await bot.copy_message(uid, src_chat, src_msg)
+                ok += 1
+            except Exception:
+                fail += 1
+        except Exception:
+            fail += 1  # botni bloklagan bo'lishi mumkin
+        await asyncio.sleep(0.05)
+    await bot.send_message(admin_chat, f"📣 Yuborildi: {ok} ta, xato: {fail} ta")
+
+
+@router.callback_query(F.data.startswith("bc:"))
+async def bc_confirm(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        await c.answer("Ruxsat yo'q", show_alert=True)
+        return
+    d = await state.get_data()
+    await state.clear()
+    if c.data == "bc:no" or "bc_msg" not in d:
+        await c.message.edit_text("❌ Bekor qilindi.")
+        await c.answer()
+        return
+    await c.message.edit_text("📣 Yuborish boshlandi, tugagach xabar beraman...")
+    await c.answer()
+    task = asyncio.create_task(do_broadcast(c.bot, d["bc_chat"], d["bc_msg"], c.message.chat.id))
+    bg_tasks.add(task)
+    task.add_done_callback(bg_tasks.discard)
 
 
 # ================================== FIKR (baho) ==================================
@@ -1164,7 +2637,7 @@ async def got_rating(c: CallbackQuery, state: FSMContext):
         await c.answer("Bu baho allaqachon qabul qilingan", show_alert=True)
         return
     await state.set_state(Form.comment)
-    await state.update_data(fb=int(fid))
+    await state.set_data({"fb": int(fid)})
     await c.message.edit_text(
         f"🙏 Rahmat! Bahoyingiz: {'⭐️' * int(score)}\n\n"
         "✍️ Xohlasangiz, fikringizni yozing (nima yoqdi, nima yoqmadi).\n"
@@ -1173,7 +2646,7 @@ async def got_rating(c: CallbackQuery, state: FSMContext):
     await tell_admin(c.bot, feedback_text(row))
 
 
-@router.message(Form.comment, F.text, ~F.text.startswith("/"))
+@router.message(Form.comment, F.text)
 async def got_comment(m: Message, state: FSMContext):
     fid = (await state.get_data()).get("fb")
     await state.clear()
@@ -1185,17 +2658,6 @@ async def got_comment(m: Message, state: FSMContext):
 
 
 # ================================= TO'LOVLAR =================================
-@router.message(Command("balance"))
-async def cmd_balance(m: Message):
-    n = get_credits(m.from_user.id, m.from_user.full_name)
-    if m.from_user.id == ADMIN_ID:
-        await m.answer("👑 Siz adminsiz: cheksiz.")
-    else:
-        await m.answer(f"💎 Sizda <b>{n}</b> ta taqdimot qoldi.\n\n"
-                       "➕ Balansni to'ldirish uchun paketni tanlang:",
-                       parse_mode="HTML", reply_markup=packs_kb())
-
-
 @router.callback_query(F.data == "buy:menu")
 async def buy_menu(c: CallbackQuery):
     await c.message.edit_text("➕ <b>Balansni to'ldirish</b>\n\nPaketni tanlang:",
@@ -1266,8 +2728,8 @@ async def pay_card(c: CallbackQuery, state: FSMContext):
     i = int(c.data.split(":")[2])
     n, _, s = PACKS[i]
     await c.answer()
-    await state.update_data(pack=i)
     await state.set_state(Form.receipt)
+    await state.set_data({"pack": i})
     await c.message.answer(
         f"💳 <b>{som(s)} so'm</b> ({n} ta taqdimot) ni shu kartaga o'tkazing:\n\n"
         f"<code>{CARD_NUMBER}</code>\n👤 {html.escape(CARD_OWNER)}\n\n"
@@ -1299,7 +2761,7 @@ async def got_receipt(m: Message, state: FSMContext):
                    reply_markup=main_kb())
 
 
-@router.message(Form.receipt, ~F.text.startswith("/"))
+@router.message(Form.receipt)
 async def receipt_not_photo(m: Message):
     await m.answer("📸 Iltimos, chek <b>rasmini</b> yuboring yoki /cancel bosing.",
                    parse_mode="HTML")
@@ -1307,7 +2769,7 @@ async def receipt_not_photo(m: Message):
 
 @router.callback_query(F.data.startswith("adm:"))
 async def admin_decide(c: CallbackQuery):
-    if c.from_user.id != ADMIN_ID:
+    if not is_admin(c.from_user.id):
         await c.answer("Ruxsat yo'q", show_alert=True)
         return
     _, action, pid = c.data.split(":")
@@ -1334,48 +2796,15 @@ async def admin_decide(c: CallbackQuery):
     await c.answer("Bajarildi")
 
 
-@router.message(Command("stats"))
-async def cmd_stats(m: Message):
-    if m.from_user.id != ADMIN_ID:
-        return
-    with closing(db()) as c:
-        users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        made = c.execute("SELECT COALESCE(SUM(made),0) FROM users").fetchone()[0]
-        stars = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payments "
-                          "WHERE kind='stars'").fetchone()
-        card = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payments "
-                         "WHERE kind='card' AND status='approved'").fetchone()
-        pend = c.execute("SELECT COUNT(*) FROM payments WHERE status='pending'").fetchone()[0]
-        fb = c.execute("SELECT COUNT(score), COALESCE(AVG(score),0) FROM feedback "
-                       "WHERE score IS NOT NULL").fetchone()
-        by_style = c.execute("SELECT style, COUNT(score) n, AVG(score) a FROM feedback "
-                             "WHERE score IS NOT NULL GROUP BY style ORDER BY a DESC").fetchall()
-    lines = [f"  {STYLES.get(r['style'], r['style'])}: {r['a']:.1f} ⭐️ ({r['n']} ta)" for r in by_style]
-    await m.answer(
-        f"📈 <b>Statistika</b>\n👥 Foydalanuvchilar: {users}\n📊 Yaratilgan taqdimotlar: {made}\n"
-        f"⭐️ Stars: {stars[0]} ta, jami {stars[1]} ⭐️\n"
-        f"💳 Karta: {card[0]} ta, jami {som(card[1])} so'm\n⏳ Kutilayotgan: {pend}\n\n"
-        f"💬 Baholar: {fb[0]} ta, o'rtacha {fb[1]:.1f}/5"
-        + ("\n🎨 Maketlar bo'yicha:\n" + "\n".join(lines) if lines else ""),
-        parse_mode="HTML")
-
-
-@router.message(Command("give"))
-async def cmd_give(m: Message):
-    """Admin: /give <user_id> <son>  - qo'lda limit berish"""
-    if m.from_user.id != ADMIN_ID:
-        return
-    try:
-        _, uid, n = m.text.split()
-        add_credits(int(uid), int(n))
-        await m.answer(f"✅ {uid} ga +{n} ta berildi. Jami: {get_credits(int(uid))}")
-    except Exception:
-        await m.answer("Format: /give 123456789 5")
+# ================================== ASOSIY ==================================
+@router.message(Form.topic, F.text)
+async def got_topic(m: Message, state: FSMContext):
+    await take_topic(m, state)
 
 
 @router.message(F.text, ~F.text.startswith("/"))
 async def fallback(m: Message, state: FSMContext):
-    """Holat yo'qolgan bo'lsa (bot qayta ishga tushgan), matnni yangi mavzu deb olamiz."""
+    """Holat bo'lmasa, matnni yangi mavzu deb olamiz."""
     await take_topic(m, state)
 
 
@@ -1421,15 +2850,28 @@ async def notify_missed(bot: Bot):
 
 
 async def main():
-    if BOT_TOKEN.startswith("BOT_TOKEN_NI") or GEMINI_KEY.startswith("GEMINI_KALIT"):
-        raise SystemExit("❗ BOT_TOKEN va GEMINI_API_KEY ni kiriting (faylning yuqori qismida)")
+    global BOT_USERNAME, gen_sem, pdf_sem
+    if BOT_TOKEN.startswith("BOT_TOKEN_NI") or GEMINI_KEYS[0].startswith("GEMINI_KALIT"):
+        raise SystemExit("❗ BOT_TOKEN va GEMINI_API_KEY ni kiriting (Railway Variables yoki fayl yuqorisida)")
     init_db()
+    gen_sem = asyncio.Semaphore(GEN_CONCURRENCY)
+    pdf_sem = asyncio.Semaphore(1)
     bot = Bot(BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
+    BOT_USERNAME = (await bot.get_me()).username
+    dp = Dispatcher(storage=SQLiteStorage())
     dp.include_router(router)
+    await bot.set_my_commands([
+        BotCommand(command="new", description="📊 Yangi taqdimot"),
+        BotCommand(command="history", description="🗂 Oldingi taqdimotlar"),
+        BotCommand(command="balance", description="💎 Balans"),
+        BotCommand(command="invite", description="🎁 Do'st taklif qilish"),
+        BotCommand(command="settings", description="⚙️ Muallif va logo"),
+        BotCommand(command="help", description="ℹ️ Yordam"),
+        BotCommand(command="cancel", description="❌ Bekor qilish"),
+    ])
     await bot.delete_webhook(drop_pending_updates=False)  # eski xabarlar saqlansin
     await notify_missed(bot)
-    log.info("Bot ishga tushdi")
+    log.info("Bot ishga tushdi (PDF: %s, Gemini kalitlari: %d)", "bor" if PDF_OK else "yo'q", len(GEMINI_KEYS))
     await dp.start_polling(bot)
 
 
