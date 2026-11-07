@@ -12,6 +12,7 @@ Imkoniyatlar:
   - Referal tizimi, /broadcast, /stats, /user, /give
   - Holat SQLite'da saqlanadi (bot qayta ishga tushsa yo'qolmaydi)
   - Bir nechta Gemini kalit (GEMINI_API_KEYS=kalit1,kalit2), generatsiya navbati
+  - YANGI: yakuniy slayd matnini AI mavzuga qarab o'zi yozadi (closing_title / closing_sub)
 
 O'rnatish:  pip install -r requirements.txt
 PDF uchun serverda LibreOffice kerak (nixpacks.toml ga qarang); bo'lmasa PDF tugmasi chiqmaydi.
@@ -96,6 +97,7 @@ LANGS = {
     "ru": ("🇷🇺 Русский", "Russian"),
     "en": ("🇬🇧 English", "English"),
 }
+# Zaxira matn: AI yakuniy matn bermasa (yoki eski taqdimotlarda) shu chiqadi
 THANKS = {
     "uz": ("E'tiboringiz uchun rahmat!", "Savollaringiz bormi?"),
     "ru": ("Спасибо за внимание!", "Есть вопросы?"),
@@ -740,6 +742,8 @@ Reply with ONLY this JSON, nothing else:
 {{
   "title": "Presentation title",
   "subtitle": "Short subtitle",
+  "closing_title": "Short memorable closing line for the final slide, max 8 words",
+  "closing_sub": "One-sentence key takeaway or call to action for the final slide, max 15 words",
   "slides": [ ...{n} slide objects... ]
 }}
 
@@ -750,6 +754,7 @@ Rules:
 - Use at most 2 slides of type "chart" or "table", and ONLY if the topic has real numeric or comparative data (otherwise use only "bullets"). Chart: 3-6 categories, values are plain numbers (put the unit in "series"). Table: 3-5 columns, 3-6 rows. Use well-known approximate figures and never fabricate precise statistics.
 - Logical flow: introduction, main parts, examples/statistics, conclusion.
 - Slide titles are short (max 6 words).
+- closing_title and closing_sub must be specific to this topic (NOT a generic "Thank you" or "Any questions?").
 - image_query must be a concrete visual subject, always in English."""
     last = None
     for _ in range(2):
@@ -760,7 +765,10 @@ Rules:
                 slides = [norm_slide(s) for s in raw if isinstance(s, dict)][:n]
                 if slides:
                     return {"title": str(data.get("title", "")).strip(),
-                            "subtitle": str(data.get("subtitle", "")).strip(), "slides": slides}
+                            "subtitle": str(data.get("subtitle", "")).strip(),
+                            "closing_title": str(data.get("closing_title", "")).strip()[:70],
+                            "closing_sub": str(data.get("closing_sub", "")).strip()[:120],
+                            "slides": slides}
             last = ValueError("Slaydlar bo'sh")
         except (ValueError, KeyError, json.JSONDecodeError) as e:
             last = e
@@ -1564,7 +1572,9 @@ def build_pptx(data, theme_key, style, lang, path, images=None, author="", logo=
 
     # ------------------------------ YAKUNIY ------------------------------
     s = prs.slides.add_slide(blank)
-    t1, t2 = THANKS[lang]
+    # AI mavzuga qarab yozgan matn; bo'lmasa (eski taqdimot) standart "Rahmat" matni
+    t1 = data.get("closing_title") or THANKS[lang][0]
+    t2 = data.get("closing_sub") or THANKS[lang][1]
     if style in ("classic", "side", "split"):
         set_bg(s, dark)
         if style == "side":
@@ -1589,8 +1599,12 @@ def build_pptx(data, theme_key, style, lang, path, images=None, author="", logo=
         rect(s, (W - Inches(2.2)) // 2, Inches(4.1), Inches(2.2), Inches(0.08), accent)
         rect(s, 0, H - Inches(0.5), W, Inches(0.5), dark)
         c1, c2 = head_c, txt
-    text(s, 0, Inches(2.5), W, Inches(1.6), t1, 44, c1, True, PP_ALIGN.CENTER, MSO_ANCHOR.MIDDLE)
-    text(s, 0, Inches(4.3), W, Inches(0.8), t2, 22, c2, align=PP_ALIGN.CENTER)
+    # Sarlavha uzun bo'lsa shrift kichraytiriladi (sig'ishi uchun)
+    t1_size = 44 if len(t1) <= 40 else 36 if len(t1) <= 60 else 30
+    text(s, Inches(0.8), Inches(2.3), W - Inches(1.6), Inches(1.7), t1, t1_size, c1, True,
+         PP_ALIGN.CENTER, MSO_ANCHOR.MIDDLE)
+    text(s, Inches(1.2), Inches(4.3), W - Inches(2.4), Inches(1.2), t2, 22, c2,
+         align=PP_ALIGN.CENTER)
 
     prs.save(path)
 
