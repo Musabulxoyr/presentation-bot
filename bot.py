@@ -102,7 +102,23 @@ def db():
     return con
 
 
+def prepare_db_path():
+    """/data ochilmasa (Volume ulanmagan bo'lsa) bot yiqilmasin: vaqtincha bot.db ishlatiladi."""
+    global DB_PATH
+    try:
+        folder = os.path.dirname(DB_PATH)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        with open(DB_PATH, "a"):
+            pass
+    except OSError as e:
+        log.warning("%s ochilmadi (%s). Vaqtincha bot.db ishlatiladi: Volume ulanganini tekshiring!",
+                    DB_PATH, e)
+        DB_PATH = "bot.db"
+
+
 def init_db():
+    prepare_db_path()
     with closing(db()) as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS users(
