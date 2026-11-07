@@ -26,8 +26,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (CallbackQuery, FSInputFile, LabeledPrice, Message,
-                           PreCheckoutQuery)
+from aiogram.types import (CallbackQuery, FSInputFile, KeyboardButton, LabeledPrice,
+                           Message, PreCheckoutQuery, ReplyKeyboardMarkup)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from PIL import Image
 from pptx import Presentation
@@ -46,9 +46,12 @@ CARD_OWNER = os.getenv("CARD_OWNER") or ""        # karta egasi ismi
 DB_PATH = os.getenv("DB_PATH") or "bot.db"        # Railway'da Volume ulasangiz: /data/bot.db
 
 FREE_LIMIT = 5      # har bir yangi foydalanuvchiga bepul taqdimotlar soni
-PACK_SIZE = 1       # bitta to'lov necha taqdimot beradi
-STARS_PRICE = 15    # Telegram Stars narxi
-SOM_PRICE = 3000    # so'mdagi narx (kartaga)
+# Balansni to'ldirish paketlari: (taqdimotlar soni, Stars narxi, so'm narxi)
+PACKS = [
+    (1, 15, 3000),
+    (5, 60, 12000),
+    (10, 100, 20000),
+]
 
 DEBUG = True  # xato sababini chatda ko'rsatadi; hammasi ishlab ketsa False qiling
 # =================================================================================
@@ -107,9 +110,14 @@ def init_db():
             made INTEGER NOT NULL DEFAULT 0, created INTEGER);
         CREATE TABLE IF NOT EXISTS payments(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, kind TEXT,
-            amount INTEGER, status TEXT, receipt TEXT, ts INTEGER);
+            amount INTEGER, status TEXT, receipt TEXT, ts INTEGER, credits INTEGER);
         """)
         c.commit()
+        try:  # eski bazalar uchun
+            c.execute("ALTER TABLE payments ADD COLUMN credits INTEGER")
+            c.commit()
+        except sqlite3.OperationalError:
+            pass
 
 
 def get_credits(uid: int, name: str = "") -> int:
@@ -137,10 +145,11 @@ def consume(uid: int):
         c.commit()
 
 
-def new_payment(uid, kind, amount, status, receipt="") -> int:
+def new_payment(uid, kind, amount, status, receipt="", credits=1) -> int:
     with closing(db()) as c:
-        cur = c.execute("INSERT INTO payments(user_id,kind,amount,status,receipt,ts) VALUES(?,?,?,?,?,?)",
-                        (uid, kind, amount, status, receipt, int(time.time())))
+        cur = c.execute("INSERT INTO payments(user_id,kind,amount,status,receipt,ts,credits) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (uid, kind, amount, status, receipt, int(time.time()), credits))
         c.commit()
         return cur.lastrowid
 
@@ -160,6 +169,21 @@ def som(n: int) -> str:
 
 
 # ================================ KLAVIATURALAR ================================
+BTN_NEW = "📊 Yangi taqdimot"
+BTN_BAL = "💎 Balans"
+BTN_BUY = "➕ Balansni to'ldirish"
+BTN_HELP = "ℹ️ Yordam"
+
+
+def main_kb():
+    """Doimiy pastki menyu."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_BAL)],
+                  [KeyboardButton(text=BTN_BUY), KeyboardButton(text=BTN_HELP)]],
+        resize_keyboard=True, is_persistent=True,
+        input_field_placeholder="Mavzuni yozing yoki tugmani bosing")
+
+
 def count_kb():
     kb = InlineKeyboardBuilder()
     for n in SLIDE_COUNTS:
@@ -184,13 +208,20 @@ def theme_kb():
     return kb.as_markup()
 
 
-def pay_kb():
+def card_on() -> bool:
+    return bool(CARD_NUMBER and ADMIN_ID)
+
+
+def packs_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text=f"⭐️ {STARS_PRICE} Stars bilan to'lash", callback_data="pay:stars")
-    if CARD_NUMBER and ADMIN_ID:
-        kb.button(text=f"💳 {som(SOM_PRICE)} so'm (karta)", callback_data="pay:card")
+    for i, (n, stars, s) in enumerate(PACKS):
+        price = f"⭐️{stars} / {som(s)} so'm" if card_on() else f"⭐️{stars}"
+        kb.button(text=f"💎 {n} ta taqdimot — {price}", callback_data=f"pack:{i}")
     kb.adjust(1)
     return kb.as_markup()
+
+
+pay_kb = packs_kb  # eski nom
 
 
 def images_kb():
@@ -511,7 +542,7 @@ async def ask_topic(m: Message, state: FSMContext):
         "👋 Salom! Men sizga professional taqdimot tayyorlab beraman.\n\n"
         "✍️ Taqdimot mavzusini yozing, masalan:\n"
         "• <i>Global isish</i>\n• <i>Sun'iy intellekt kelajagi</i>\n• <i>Amir Temur</i>",
-        parse_mode="HTML",
+        parse_mode="HTML", reply_markup=main_kb(),
     )
 
 
@@ -525,7 +556,7 @@ async def cmd_start(m: Message, state: FSMContext):
 async def cmd_cancel(m: Message, state: FSMContext):
     await state.clear()
     busy_users.discard(m.from_user.id)
-    await m.answer("❌ Bekor qilindi. Yangi taqdimot uchun /new ni bosing.")
+    await m.answer("❌ Bekor qilindi. Yangi taqdimot uchun /new ni bosing.", reply_markup=main_kb())
 
 
 @router.message(Command("help"))
@@ -540,13 +571,32 @@ async def cmd_help(m: Message):
     )
 
 
+@router.message(F.text == BTN_NEW)
+async def btn_new(m: Message, state: FSMContext):
+    await ask_topic(m, state)
+
+
+@router.message(F.text == BTN_BAL)
+async def btn_balance(m: Message):
+    await cmd_balance(m)
+
+
+@router.message(F.text == BTN_BUY)
+async def btn_buy(m: Message):
+    await m.answer("➕ <b>Balansni to'ldirish</b>\n\nPaketni tanlang:",
+                   parse_mode="HTML", reply_markup=packs_kb())
+
+
+@router.message(F.text == BTN_HELP)
+async def btn_help(m: Message):
+    await cmd_help(m)
+
+
 async def show_paywall(m: Message):
     await m.answer(
         "😔 <b>Bepul limitingiz tugadi.</b>\n\n"
-        f"Davom etish uchun to'lov qiling, har to'lov <b>+{PACK_SIZE} ta taqdimot</b> beradi:\n"
-        f"⭐️ {STARS_PRICE} Telegram Stars\n"
-        + (f"💳 {som(SOM_PRICE)} so'm (karta orqali)\n" if CARD_NUMBER and ADMIN_ID else ""),
-        parse_mode="HTML", reply_markup=pay_kb())
+        "➕ Davom etish uchun balansni to'ldiring, paketni tanlang:",
+        parse_mode="HTML", reply_markup=packs_kb())
 
 
 async def take_topic(m: Message, state: FSMContext):
@@ -654,6 +704,7 @@ async def got_images(c: CallbackQuery, state: FSMContext):
             caption=(f"✅ Tayyor! 📊 {count} slayd\n🎯 Mavzu: {topic}{extra}\n"
                      "🗣 Har slaydda ma'ruzachi uchun izohlar (Notes) bor.\n\n"
                      "Yangi taqdimot: /new"),
+            reply_markup=main_kb(),
         )
         consume(uid)  # limit faqat muvaffaqiyatli yuborilgandan keyin kamayadi
         await status.delete()
@@ -677,19 +728,44 @@ async def cmd_balance(m: Message):
     if m.from_user.id == ADMIN_ID:
         await m.answer("👑 Siz adminsiz: cheksiz.")
     else:
-        await m.answer(f"💎 Sizda <b>{n}</b> ta taqdimot qoldi.", parse_mode="HTML",
-                       reply_markup=pay_kb())
+        await m.answer(f"💎 Sizda <b>{n}</b> ta taqdimot qoldi.\n\n"
+                       "➕ Balansni to'ldirish uchun paketni tanlang:",
+                       parse_mode="HTML", reply_markup=packs_kb())
 
 
-@router.callback_query(F.data == "pay:stars")
+@router.callback_query(F.data == "buy:menu")
+async def buy_menu(c: CallbackQuery):
+    await c.message.edit_text("➕ <b>Balansni to'ldirish</b>\n\nPaketni tanlang:",
+                              parse_mode="HTML", reply_markup=packs_kb())
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("pack:"))
+async def choose_pack(c: CallbackQuery):
+    i = int(c.data.split(":")[1])
+    n, stars, s = PACKS[i]
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"⭐️ {stars} Stars bilan to'lash", callback_data=f"pay:stars:{i}")
+    if card_on():
+        kb.button(text=f"💳 {som(s)} so'm (karta)", callback_data=f"pay:card:{i}")
+    kb.button(text="⬅️ Orqaga", callback_data="buy:menu")
+    kb.adjust(1)
+    await c.message.edit_text(f"📦 Paket: <b>{n} ta taqdimot</b>\n\nTo'lov usulini tanlang:",
+                              parse_mode="HTML", reply_markup=kb.as_markup())
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("pay:stars:"))
 async def pay_stars(c: CallbackQuery):
+    i = int(c.data.split(":")[2])
+    n, stars, _ = PACKS[i]
     await c.answer()
     await c.message.answer_invoice(
         title="📊 Taqdimot paketi",
-        description=f"{PACK_SIZE} ta taqdimot yaratish",
-        payload=f"pack:{c.from_user.id}",
+        description=f"{n} ta taqdimot yaratish",
+        payload=f"pack:{i}",
         currency="XTR",  # Telegram Stars
-        prices=[LabeledPrice(label=f"{PACK_SIZE} ta taqdimot", amount=STARS_PRICE)],
+        prices=[LabeledPrice(label=f"{n} ta taqdimot", amount=stars)],
     )
 
 
@@ -702,38 +778,49 @@ async def pre_checkout(q: PreCheckoutQuery):
 async def stars_paid(m: Message):
     sp = m.successful_payment
     uid = m.from_user.id
-    new_payment(uid, "stars", sp.total_amount, "paid", sp.telegram_payment_charge_id)
-    add_credits(uid, PACK_SIZE)
-    await m.answer(f"✅ To'lov qabul qilindi! +{PACK_SIZE} ta taqdimot.\n"
-                   f"💎 Jami: {get_credits(uid)} ta\n\n📊 Boshlash: /new")
+    try:
+        n = PACKS[int(sp.invoice_payload.split(":")[1])][0]
+    except Exception:
+        n = 1
+    new_payment(uid, "stars", sp.total_amount, "paid", sp.telegram_payment_charge_id, n)
+    add_credits(uid, n)
+    await m.answer(f"✅ To'lov qabul qilindi! +{n} ta taqdimot.\n"
+                   f"💎 Jami: {get_credits(uid)} ta\n\n📊 Boshlash: /new",
+                   reply_markup=main_kb())
     if ADMIN_ID:
         try:
-            await m.bot.send_message(ADMIN_ID, f"⭐️ {sp.total_amount} Stars to'landi: "
+            await m.bot.send_message(ADMIN_ID, f"⭐️ {sp.total_amount} Stars to'landi (+{n}): "
                                                f"{m.from_user.full_name} (id {uid})")
         except Exception:
             pass
 
 
-@router.callback_query(F.data == "pay:card")
+@router.callback_query(F.data.startswith("pay:card:"))
 async def pay_card(c: CallbackQuery, state: FSMContext):
-    if not (CARD_NUMBER and ADMIN_ID):
+    if not card_on():
         await c.answer("Karta orqali to'lov hozircha yo'q", show_alert=True)
         return
+    i = int(c.data.split(":")[2])
+    n, _, s = PACKS[i]
     await c.answer()
+    await state.update_data(pack=i)
     await state.set_state(Form.receipt)
     await c.message.answer(
-        f"💳 <b>{som(SOM_PRICE)} so'm</b> ni shu kartaga o'tkazing:\n\n"
+        f"💳 <b>{som(s)} so'm</b> ({n} ta taqdimot) ni shu kartaga o'tkazing:\n\n"
         f"<code>{CARD_NUMBER}</code>\n👤 {html.escape(CARD_OWNER)}\n\n"
-        "O'tkazgach <b>chek rasmini (skrinshot)</b> shu yerga yuboring. "
-        "Admin tekshirib tasdiqlaydi.\n\nBekor qilish: /cancel",
+        "O'tkazgach <b>chek rasmini (skrinshot)</b> shu yerga yuboring.\n"
+        "🙏 Kechirasiz, karta to'lovini admin qo'lda tekshiradi, shuning uchun "
+        "tasdiqlanishi biroz vaqt olishi mumkin.\n\nBekor qilish: /cancel",
         parse_mode="HTML")
 
 
 @router.message(Form.receipt, F.photo)
 async def got_receipt(m: Message, state: FSMContext):
     uid = m.from_user.id
+    i = (await state.get_data()).get("pack", 0)
+    n, _, s = PACKS[i]
     file_id = m.photo[-1].file_id
-    pid = new_payment(uid, "card", SOM_PRICE, "pending", file_id)
+    pid = new_payment(uid, "card", s, "pending", file_id, n)
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Tasdiqlash", callback_data=f"adm:ok:{pid}")
     kb.button(text="❌ Rad etish", callback_data=f"adm:no:{pid}")
@@ -741,9 +828,12 @@ async def got_receipt(m: Message, state: FSMContext):
     await m.bot.send_photo(
         ADMIN_ID, file_id, reply_markup=kb.as_markup(),
         caption=f"💳 To'lov so'rovi #{pid}\n👤 {m.from_user.full_name} (id {uid})\n"
-                f"💰 {som(SOM_PRICE)} so'm")
+                f"💰 {som(s)} so'm → {n} ta taqdimot")
     await state.clear()
-    await m.answer("✅ Chek adminga yuborildi. Tasdiqlangach xabar keladi.")
+    await m.answer("🙏 Kechirasiz, chekingizni admin tekshirishi kerak.\n"
+                   "Iltimos, biroz kuting. Tasdiqlangach balansingiz to'ldiriladi "
+                   "va sizga xabar keladi.",
+                   reply_markup=main_kb())
 
 
 @router.message(Form.receipt, ~F.text.startswith("/"))
@@ -764,14 +854,15 @@ async def admin_decide(c: CallbackQuery):
         await c.answer("Bu so'rov allaqachon ko'rib chiqilgan", show_alert=True)
         return
     uid = row["user_id"]
+    n = row["credits"] or 1
     try:
         if ok:
-            add_credits(uid, PACK_SIZE)
-            await c.bot.send_message(uid, f"✅ To'lov tasdiqlandi! +{PACK_SIZE} ta taqdimot.\n"
+            add_credits(uid, n)
+            await c.bot.send_message(uid, f"✅ To'lov tasdiqlandi! +{n} ta taqdimot.\n"
                                           f"💎 Jami: {get_credits(uid)} ta\n\n📊 Boshlash: /new")
         else:
             await c.bot.send_message(uid, "❌ To'lovingiz tasdiqlanmadi. "
-                                          "Chek noto'g'ri bo'lsa, qayta yuboring: /new")
+                                          "Chek noto'g'ri bo'lsa, qayta yuboring: ➕ Balansni to'ldirish")
     except Exception as e:
         log.warning("Foydalanuvchiga xabar ketmadi: %s", e)
     await c.message.edit_caption(
