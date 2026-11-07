@@ -12,12 +12,18 @@ Imkoniyatlar:
   - Referal tizimi, /broadcast, /stats, /user, /give
   - Holat SQLite'da saqlanadi (bot qayta ishga tushsa yo'qolmaydi)
   - Bir nechta Gemini kalit (GEMINI_API_KEYS=kalit1,kalit2), generatsiya navbati
-  - YANGI: yakuniy slayd matnini AI mavzuga qarab o'zi yozadi (closing_title / closing_sub)
+  - Yakuniy slayd matnini AI mavzuga qarab o'zi yozadi (closing_title / closing_sub)
+  - YANGI: slayd soni tugmalari + "Boshqa" (o'zi xohlagan sonni yozadi)
+  - YANGI: SPAM himoyasi (juda tez bosgan/yozganni vaqtincha to'xtatadi)
+  - YANGI: avtomatik ZAXIRA (bazani adminga yuboradi) + /backup
+  - YANGI: kunlik BONUS (150 so'm) + "Kunlik bonus" tugmasi va /bonus
 
 O'rnatish:  pip install -r requirements.txt
 PDF uchun serverda LibreOffice kerak (nixpacks.toml ga qarang); bo'lmasa PDF tugmasi chiqmaydi.
 """
 import asyncio
+import glob
+import gzip
 import html
 import io
 import json
@@ -33,7 +39,7 @@ import time
 from contextlib import asynccontextmanager, closing
 
 import aiohttp
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -73,6 +79,20 @@ KEEP_DECKS = 10         # /history da saqlanadigan taqdimotlar soni
 KEEP_IMG = 3            # shulardan nechtasining rasmlari bazada saqlanadi (qolganlari kerak bo'lsa qayta qidiriladi)
 SOURCE_MAX = 20000      # fayldan olinadigan matn uzunligi (belgi)
 GEN_CONCURRENCY = int(os.getenv("GEN_CONCURRENCY") or 3)  # bir vaqtda nechta generatsiya
+
+BONUS_SOM = 150         # kunlik bonus (so'm); har kuni bir marta, faqat bot ichida ishlatiladi
+TZ_OFFSET = 5 * 3600    # "kun" Toshkent vaqti (UTC+5) bo'yicha yangilanadi
+
+MIN_SLIDES = 3          # "Boshqa" tugmasi orqali yozish mumkin bo'lgan eng kam slayd soni
+MAX_SLIDES = 30         # ... va eng ko'p soni
+
+SPAM_WINDOW = 5         # soniya: shu vaqt ichida
+SPAM_MAX = 8            # ... shuncha so'rovdan ko'p bo'lsa spam hisoblanadi
+SPAM_BLOCK = 30         # soniya: spamchi shuncha vaqt to'xtatiladi
+
+BACKUP_HOURS = float(os.getenv("BACKUP_HOURS") or 24)  # zaxira necha soatda bir marta
+BACKUP_KEEP = 5         # serverda oxirgi nechta zaxira fayl saqlansin
+
 # Balansni to'ldirish paketlari: (taqdimotlar soni, Stars narxi, so'm narxi)
 PACKS = [
     (1, 15, 3000),
@@ -155,6 +175,7 @@ _waiting = 0
 
 class Form(StatesGroup):
     topic = State()
+    count_input = State()
     receipt = State()
     comment = State()
     edit_text = State()
@@ -201,7 +222,7 @@ def init_db():
             user_id INTEGER PRIMARY KEY, name TEXT, credits INTEGER NOT NULL,
             made INTEGER NOT NULL DEFAULT 0, created INTEGER,
             referrer INTEGER, ref_paid INTEGER NOT NULL DEFAULT 0, author TEXT, logo BLOB,
-            balance INTEGER NOT NULL DEFAULT 0);
+            balance INTEGER NOT NULL DEFAULT 0, bonus_day TEXT);
         CREATE TABLE IF NOT EXISTS payments(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, kind TEXT,
             amount INTEGER, status TEXT, receipt TEXT, ts INTEGER, credits INTEGER);
@@ -214,6 +235,8 @@ def init_db():
             edits INTEGER NOT NULL DEFAULT 0, ts INTEGER);
         CREATE TABLE IF NOT EXISTS fsm(
             key TEXT PRIMARY KEY, state TEXT, data TEXT NOT NULL DEFAULT '{}');
+        CREATE TABLE IF NOT EXISTS meta(
+            key TEXT PRIMARY KEY, value TEXT);
         """)
         c.commit()
         # eski bazalar uchun
@@ -223,6 +246,20 @@ def init_db():
         add_column(c, "users", "author TEXT")
         add_column(c, "users", "logo BLOB")
         add_column(c, "users", "balance INTEGER NOT NULL DEFAULT 0")
+        add_column(c, "users", "bonus_day TEXT")
+
+
+def meta_get(key: str, default: str = ""):
+    with closing(db()) as c:
+        r = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else default
+
+
+def meta_set(key: str, value: str):
+    with closing(db()) as c:
+        c.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        c.commit()
 
 
 # ---------------- FSM holati SQLite'da (qayta ishga tushsa yo'qolmaydi) ----------------
@@ -310,6 +347,31 @@ def spend_money(uid: int, n: int) -> bool:
         cur = c.execute("UPDATE users SET balance=balance-? WHERE user_id=? AND balance>=?", (n, uid, n))
         c.commit()
         return cur.rowcount == 1
+
+
+# ---------------- Kunlik bonus ----------------
+def today_key() -> str:
+    """Bugungi sana (Toshkent vaqti bilan)."""
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + TZ_OFFSET))
+
+
+def claim_daily(uid: int) -> bool:
+    """Kunlik bonusni beradi. Bugun olingan bo'lsa False (ikki marta olib bo'lmaydi)."""
+    ensure_user(uid)
+    day = today_key()
+    with closing(db()) as c:
+        cur = c.execute("UPDATE users SET balance=balance+?, bonus_day=? "
+                        "WHERE user_id=? AND (bonus_day IS NULL OR bonus_day<>?)",
+                        (BONUS_SOM, day, uid, day))
+        c.commit()
+        return cur.rowcount == 1
+
+
+def bonus_wait_text() -> str:
+    """Keyingi bonusgacha qancha vaqt qolgani (Toshkent yarim kechasigacha)."""
+    left = 86400 - ((time.time() + TZ_OFFSET) % 86400)
+    h, mnt = int(left // 3600), int(left % 3600 // 60)
+    return f"{h} soat {mnt} daqiqa"
 
 
 def consume(uid: int):
@@ -464,6 +526,135 @@ def som(n: int) -> str:
     return f"{n:,}".replace(",", " ")
 
 
+# ============================ AVTOMATIK ZAXIRA ============================
+def _gzip_file(src: str, dst: str):
+    with open(src, "rb") as f_in, gzip.open(dst, "wb", compresslevel=6) as f_out:
+        shutil.copyfileobj(f_in, f_out)
+
+
+def make_backup() -> str:
+    """Bazaning to'liq nusxasini (gzip) yaratadi. Fayl yo'lini qaytaradi.
+    Telegram 50 MB dan katta faylni qabul qilmaydi: katta bo'lsa rasmlarsiz yengil nusxa olinadi."""
+    folder = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups")
+    os.makedirs(folder, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    tmp = os.path.join(folder, f"bot_{stamp}.db")
+    gz = tmp + ".gz"
+    src = sqlite3.connect(DB_PATH)
+    dst = sqlite3.connect(tmp)
+    try:
+        src.backup(dst)  # ishlab turgan bazadan xavfsiz nusxa
+    finally:
+        dst.close()
+        src.close()
+    _gzip_file(tmp, gz)
+    if os.path.getsize(gz) > 48 * 1024 * 1024:
+        lite = sqlite3.connect(tmp)
+        try:
+            lite.execute("UPDATE decks SET images=NULL")
+            lite.execute("DELETE FROM fsm")
+            lite.commit()
+            lite.execute("VACUUM")
+        finally:
+            lite.close()
+        _gzip_file(tmp, gz)
+    rm(tmp)
+    # eski zaxiralarni tozalash
+    olds = sorted(glob.glob(os.path.join(folder, "bot_*.db.gz")))
+    for p in olds[:-BACKUP_KEEP]:
+        rm(p)
+    return gz
+
+
+async def run_backup(bot: Bot) -> bool:
+    try:
+        path = await asyncio.to_thread(make_backup)
+        meta_set("last_backup", str(int(time.time())))
+        kb = max(os.path.getsize(path) // 1024, 1)
+        if ADMIN_ID:
+            await bot.send_document(
+                ADMIN_ID, FSInputFile(path, filename=os.path.basename(path)),
+                caption=(f"💾 Bazaning zaxira nusxasi ({kb} KB)\n"
+                         f"🕐 {time.strftime('%d.%m.%Y %H:%M', time.gmtime(time.time() + TZ_OFFSET))}\n\n"
+                         "Tiklash: faylni .gz dan chiqaring (gunzip), bot.db nomi bilan "
+                         "DB_PATH joyiga qo'ying va botni qayta ishga tushiring."))
+        return True
+    except Exception as e:
+        log.exception("Zaxira xatosi")
+        if ADMIN_ID:
+            try:
+                await bot.send_message(ADMIN_ID, f"⚠️ Zaxira olishda xato: {type(e).__name__}: {str(e)[:200]}")
+            except Exception:
+                pass
+        return False
+
+
+async def backup_loop(bot: Bot):
+    """Har BACKUP_HOURS soatda bazani adminga yuboradi. Oxirgi zaxira vaqti bazada saqlanadi,
+    shuning uchun bot tez-tez qayta ishga tushsa ham xabarlar ko'payib ketmaydi."""
+    interval = max(int(BACKUP_HOURS * 3600), 600)
+    while True:
+        try:
+            last = int(meta_get("last_backup", "0") or 0)
+        except ValueError:
+            last = 0
+        wait = max(60, last + interval - int(time.time()))
+        await asyncio.sleep(wait)
+        ok = await run_backup(bot)
+        if not ok:
+            await asyncio.sleep(3600)  # xato bo'lsa 1 soatdan keyin qayta uriniladi
+
+
+# ============================ SPAM HIMOYASI ============================
+class AntiSpam(BaseMiddleware):
+    """Juda tez yozgan/bosgan foydalanuvchini SPAM_BLOCK soniyaga to'xtatadi. Admin uchun ishlamaydi."""
+
+    def __init__(self):
+        self.hits: dict[int, list] = {}
+        self.until: dict[int, float] = {}
+
+    def _prune(self, now: float):
+        for uid in list(self.hits):
+            h = self.hits[uid]
+            if (not h or now - h[-1] > SPAM_WINDOW) and self.until.get(uid, 0) <= now:
+                self.hits.pop(uid, None)
+                self.until.pop(uid, None)
+
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user is None or is_admin(user.id):
+            return await handler(event, data)
+        # To'lov xabarini hech qachon tashlab yubormaymiz
+        if isinstance(event, Message) and event.successful_payment:
+            return await handler(event, data)
+        now = time.monotonic()
+        if self.until.get(user.id, 0) > now:
+            if isinstance(event, CallbackQuery):
+                try:
+                    await event.answer("⏳ Juda tez! Biroz kuting.")
+                except Exception:
+                    pass
+            return None
+        hits = [t for t in self.hits.get(user.id, []) if now - t < SPAM_WINDOW]
+        hits.append(now)
+        self.hits[user.id] = hits
+        if len(hits) > SPAM_MAX:
+            self.until[user.id] = now + SPAM_BLOCK
+            self.hits[user.id] = []
+            warn = f"⛔ Juda tez-tez so'rov yuboryapsiz. {SPAM_BLOCK} soniya kuting."
+            try:
+                if isinstance(event, CallbackQuery):
+                    await event.answer(warn, show_alert=True)
+                elif isinstance(event, Message):
+                    await event.answer(warn)
+            except Exception:
+                pass
+            return None
+        if len(self.hits) > 5000:
+            self._prune(now)
+        return await handler(event, data)
+
+
 # ================================ KLAVIATURALAR ================================
 BTN_NEW = "📊 Yangi taqdimot"
 BTN_HIST = "🗂 Tarix"
@@ -472,6 +663,7 @@ BTN_BUY = "➕ Balansni to'ldirish"
 BTN_REF = "🎁 Do'st taklif"
 BTN_SET = "⚙️ Sozlamalar"
 BTN_HELP = "ℹ️ Yordam"
+BTN_BONUS = "🎉 Kunlik bonus"
 
 
 def main_kb():
@@ -480,7 +672,8 @@ def main_kb():
         keyboard=[[KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_HIST)],
                   [KeyboardButton(text=BTN_BAL), KeyboardButton(text=BTN_BUY)],
                   [KeyboardButton(text=BTN_REF), KeyboardButton(text=BTN_SET)],
-                  [KeyboardButton(text=BTN_HELP)]],
+                  [KeyboardButton(text=BTN_HELP)],
+                  [KeyboardButton(text=BTN_BONUS)]],
         resize_keyboard=True, is_persistent=True,
         input_field_placeholder="Mavzuni yozing, fayl yuboring yoki tugmani bosing")
 
@@ -489,7 +682,8 @@ def count_kb():
     kb = InlineKeyboardBuilder()
     for n in SLIDE_COUNTS:
         kb.button(text=f"📊 {n} slayd", callback_data=f"count:{n}")
-    kb.adjust(2, 2, 2, 1)
+    kb.button(text="✏️ Boshqa (o'zim yozaman)", callback_data="count:other")
+    kb.adjust(2, 2, 2, 1, 1)
     return kb.as_markup()
 
 
@@ -647,12 +841,13 @@ async def call_gemini(session, model: str, key: str, body: dict):
 async def gemini(prompt: str) -> str:
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7},
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7,
+                             "maxOutputTokens": 16384},  # katta (20-30 slaydli) taqdimotlar uchun
     }
     errors = []
     dead = set()
     keys = rotated_keys()
-    timeout = aiohttp.ClientTimeout(total=150)
+    timeout = aiohttp.ClientTimeout(total=240)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         order = []
         for m in [os.getenv("AI_MODEL", "")] + MODELS + await discover_models(session):
@@ -782,6 +977,7 @@ Rules:
 - closing_title and closing_sub must be specific to this topic (NOT a generic "Thank you" or "Any questions?").
 - image_query must be a concrete visual subject, always in English."""
     last = None
+    best = None  # kam slayd qaytsa ham eng yaxshi natijani saqlab qo'yamiz
     for _ in range(2):
         try:
             data = extract_json(await gemini(prompt))
@@ -789,14 +985,22 @@ Rules:
             if isinstance(raw, list):
                 slides = [norm_slide(s) for s in raw if isinstance(s, dict)][:n]
                 if slides:
-                    return {"title": str(data.get("title", "")).strip(),
-                            "subtitle": str(data.get("subtitle", "")).strip(),
-                            "closing_title": str(data.get("closing_title", "")).strip()[:70],
-                            "closing_sub": str(data.get("closing_sub", "")).strip()[:120],
-                            "slides": slides}
+                    res = {"title": str(data.get("title", "")).strip(),
+                           "subtitle": str(data.get("subtitle", "")).strip(),
+                           "closing_title": str(data.get("closing_title", "")).strip()[:70],
+                           "closing_sub": str(data.get("closing_sub", "")).strip()[:120],
+                           "slides": slides}
+                    if len(slides) >= n:
+                        return res
+                    if best is None or len(slides) > len(best["slides"]):
+                        best = res
+                    last = ValueError("Slaydlar yetarli emas")
+                    continue
             last = ValueError("Slaydlar bo'sh")
         except (ValueError, KeyError, json.JSONDecodeError) as e:
             last = e
+    if best:
+        return best
     raise last
 
 
@@ -1825,11 +2029,12 @@ async def cmd_help(m: Message):
     await m.answer(
         "ℹ️ <b>Qanday ishlaydi?</b>\n"
         "1️⃣ Mavzuni yozasiz (yoki PDF/DOCX/TXT fayl yuborasiz)\n"
-        "2️⃣ Slayd soni, til, rang va maketni tanlaysiz (maket namunalari ko'rsatiladi)\n"
+        f"2️⃣ Slayd soni ({MIN_SLIDES}-{MAX_SLIDES}), til, rang va maketni tanlaysiz (maket namunalari ko'rsatiladi)\n"
         "3️⃣ Rasm kerakmi — tanlaysiz\n"
         "4️⃣ Tayyor <b>rejani</b> ko'rib tasdiqlaysiz\n"
         "5️⃣ .pptx faylni olasiz, so'ng uni tahrirlash, dizaynini almashtirish yoki PDF qilish mumkin\n\n"
         "/new — yangi taqdimot\n/history — oldingi taqdimotlar\n/balance — balans\n"
+        f"/bonus — kunlik bonus (+{som(BONUS_SOM)} so'm)\n"
         "/invite — do'st taklif qilib bonus olish\n/settings — muallif ismi va logo\n/cancel — bekor qilish",
         parse_mode="HTML",
     )
@@ -1843,9 +2048,30 @@ async def cmd_balance(m: Message):
     else:
         money = get_money(m.from_user.id)
         await m.answer(f"💎 Sizda <b>{n}</b> ta taqdimot qoldi.\n"
-                       f"💰 Bonus balans: <b>{som(money)} so'm</b> (faqat botda ishlatiladi)\n\n"
+                       f"💰 Bonus balans: <b>{som(money)} so'm</b> (faqat botda ishlatiladi)\n"
+                       f"🎉 Har kuni /bonus orqali +{som(BONUS_SOM)} so'm oling!\n\n"
                        "➕ Paketni tanlang (balansdan ham to'lash mumkin):",
                        parse_mode="HTML", reply_markup=packs_kb())
+
+
+@router.message(Command("bonus"))
+@router.message(F.text == BTN_BONUS)
+async def cmd_bonus(m: Message):
+    """Kunlik bonus: har kuni bir marta."""
+    uid = m.from_user.id
+    ensure_user(uid, m.from_user.full_name)
+    if claim_daily(uid):
+        await m.answer(
+            f"🎉 <b>Kunlik bonus: +{som(BONUS_SOM)} so'm!</b>\n"
+            f"💰 Balansingiz: <b>{som(get_money(uid))} so'm</b>\n\n"
+            "Ertaga yana kelib, bonusni oling. Bu pul faqat bot ichida taqdimot uchun to'lashda ishlatiladi.",
+            parse_mode="HTML", reply_markup=main_kb())
+    else:
+        await m.answer(
+            "⏳ Bugungi bonusni allaqachon olgansiz.\n"
+            f"🕐 Keyingi bonus: <b>{bonus_wait_text()}</b> dan keyin.\n"
+            f"💰 Balansingiz: <b>{som(get_money(uid))} so'm</b>",
+            parse_mode="HTML", reply_markup=main_kb())
 
 
 @router.message(Command("history"))
@@ -1921,6 +2147,16 @@ async def cmd_broadcast(m: Message, state: FSMContext):
                    "Bekor qilish: /cancel")
 
 
+@router.message(Command("backup"))
+async def cmd_backup(m: Message):
+    """Admin: bazaning zaxira nusxasini hozir yuborish."""
+    if not is_admin(m.from_user.id):
+        return
+    st = await m.answer("💾 Zaxira tayyorlanmoqda...")
+    ok = await run_backup(m.bot)
+    await safe_edit(st, "✅ Zaxira nusxa yuborildi." if ok else "⚠️ Zaxira olib bo'lmadi (loglarni ko'ring).")
+
+
 @router.message(Command("stats"))
 async def cmd_stats(m: Message):
     if not is_admin(m.from_user.id):
@@ -1942,13 +2178,21 @@ async def cmd_stats(m: Message):
                        "WHERE score IS NOT NULL").fetchone()
         by_style = c.execute("SELECT style, COUNT(score) n, AVG(score) a FROM feedback "
                              "WHERE score IS NOT NULL GROUP BY style ORDER BY a DESC").fetchall()
+        bonus_today = c.execute("SELECT COUNT(*) FROM users WHERE bonus_day=?", (today_key(),)).fetchone()[0]
     lines = [f"  {STYLES.get(r['style'], r['style'])}: {r['a']:.1f} ⭐️ ({r['n']} ta)" for r in by_style]
+    try:
+        last_bk = int(meta_get("last_backup", "0") or 0)
+    except ValueError:
+        last_bk = 0
+    bk_txt = (time.strftime("%d.%m %H:%M", time.gmtime(last_bk + TZ_OFFSET)) if last_bk else "hali yo'q")
     await m.answer(
         f"📈 <b>Statistika</b>\n👥 Foydalanuvchilar: {users} (24 soatda +{new24})\n"
         f"📊 Yaratilgan taqdimotlar: {made}\n✏️ Tahrirlar: {edits}\n"
         f"🎁 Referallar: {refs[0]} ta (bonus berilgan: {refs[1]})\n"
+        f"🎉 Bugun kunlik bonus olganlar: {bonus_today}\n"
         f"⭐️ Stars: {stars[0]} ta, jami {stars[1]} ⭐️\n"
-        f"💳 Karta: {card[0]} ta, jami {som(card[1])} so'm\n⏳ Kutilayotgan: {pend}\n\n"
+        f"💳 Karta: {card[0]} ta, jami {som(card[1])} so'm\n⏳ Kutilayotgan: {pend}\n"
+        f"💾 Oxirgi zaxira: {bk_txt}\n\n"
         f"💬 Baholar: {fb[0]} ta, o'rtacha {fb[1]:.1f}/5"
         + ("\n🎨 Maketlar bo'yicha:\n" + "\n".join(lines) if lines else ""),
         parse_mode="HTML")
@@ -1987,7 +2231,8 @@ async def cmd_user(m: Message):
     await m.answer(
         f"👤 {html.escape(r['name'] or '')} (id {uid})\n💎 Limit: {r['credits']}\n"
         f"💰 Bonus balans: {som(r['balance'] or 0)} so'm\n📊 Yaratgan: {r['made']}\n🗂 Tarixda: {nd}\n🎁 Taklif qilgan: {a} (bonus: {b})\n"
-        f"👥 Taklif qilgan odam: {r['referrer'] or '-'}\n✍️ Muallif: {html.escape(r['author'] or '-')}",
+        f"👥 Taklif qilgan odam: {r['referrer'] or '-'}\n✍️ Muallif: {html.escape(r['author'] or '-')}\n"
+        f"🎉 Oxirgi kunlik bonus: {r['bonus_day'] or '-'}",
         parse_mode="HTML")
 
 
@@ -2031,7 +2276,8 @@ async def btn_help(m: Message):
 async def show_paywall(m: Message):
     await m.answer(
         "😔 <b>Bepul limitingiz tugadi.</b>\n\n"
-        "➕ Davom etish uchun balansni to'ldiring yoki do'stlaringizni taklif qiling (/invite).\n"
+        "➕ Davom etish uchun balansni to'ldiring, do'stlaringizni taklif qiling (/invite) "
+        f"yoki har kuni /bonus orqali +{som(BONUS_SOM)} so'm yig'ing.\n"
         "Paketni tanlang:",
         parse_mode="HTML", reply_markup=packs_kb())
 
@@ -2051,12 +2297,51 @@ async def take_topic(m: Message, state: FSMContext):
 
 
 # ---------- Tanlov bosqichlari ----------
+@router.callback_query(F.data == "count:other")
+async def count_other(c: CallbackQuery, state: FSMContext):
+    """'Boshqa' tugmasi: foydalanuvchi slayd sonini o'zi yozadi."""
+    if "topic" not in await state.get_data():
+        await c.answer("Avval mavzuni yozing: /new", show_alert=True)
+        return
+    await state.set_state(Form.count_input)
+    await c.message.edit_text(
+        f"✏️ Nechta slayd kerak? <b>{MIN_SLIDES}</b> dan <b>{MAX_SLIDES}</b> gacha son yozing "
+        "(masalan: <i>14</i>).\nBekor qilish: /cancel",
+        parse_mode="HTML")
+    await c.answer()
+
+
+@router.message(Form.count_input, F.text)
+async def got_count_text(m: Message, state: FSMContext):
+    if "topic" not in await state.get_data():
+        await state.clear()
+        await m.answer("Avval mavzuni yozing: /new")
+        return
+    t = (m.text or "").strip()
+    if not t.isdigit() or not MIN_SLIDES <= int(t) <= MAX_SLIDES:
+        await m.answer(f"⚠️ {MIN_SLIDES} dan {MAX_SLIDES} gacha bo'lgan son yozing (masalan: 14).")
+        return
+    n = int(t)
+    await state.set_state(None)
+    await state.update_data(count=n)
+    await m.answer(f"📊 Slaydlar soni: <b>{n}</b>\n\n🌐 Taqdimot tilini tanlang:",
+                   parse_mode="HTML", reply_markup=lang_kb())
+
+
 @router.callback_query(F.data.startswith("count:"))
 async def got_count(c: CallbackQuery, state: FSMContext):
     if "topic" not in await state.get_data():
         await c.answer("Avval mavzuni yozing: /new", show_alert=True)
         return
-    n = int(c.data.split(":")[1])
+    try:
+        n = int(c.data.split(":")[1])
+    except ValueError:
+        await c.answer("Noma'lum tanlov", show_alert=True)
+        return
+    if not MIN_SLIDES <= n <= MAX_SLIDES:
+        await c.answer("Noto'g'ri son", show_alert=True)
+        return
+    await state.set_state(None)  # "Boshqa" holatida qolgan bo'lsa tozalaymiz
     await state.update_data(count=n)
     await c.message.edit_text(f"📊 Slaydlar soni: <b>{n}</b>\n\n🌐 Taqdimot tilini tanlang:",
                               parse_mode="HTML", reply_markup=lang_kb())
@@ -2119,7 +2404,7 @@ ICONS = {"chart": "📊 ", "table": "🧮 "}
 
 
 async def show_plan(msg: Message, content: dict, regen: int):
-    lines = [f"{i}. {ICONS.get(sl['type'], '')}{html.escape(sl['title'])}"
+    lines = [f"{i}. {ICONS.get(sl['type'], '')}{html.escape(sl['title'][:60])}"
              for i, sl in enumerate(content["slides"], start=1)]
     body = (f"📋 <b>{html.escape(content.get('title', ''))}</b>\n"
             f"<i>{html.escape(content.get('subtitle', ''))}</i>\n\n" + "\n".join(lines) +
@@ -2234,9 +2519,10 @@ async def plan_ok(c: CallbackQuery, state: FSMContext):
             extra += f"\n🖼 Rasmlar: {found} ta"
         if not is_admin(uid):
             extra += f"\n💎 Qolgan limit: {max(get_credits(uid) - 1, 0)} ta"
+        real_count = len(content["slides"]) + 2  # AI kam slayd qaytargan bo'lishi mumkin
         await c.message.answer_document(
             FSInputFile(path, filename=safe_name(topic)),
-            caption=(f"✅ Tayyor! 📊 {count} slayd\n🎯 Mavzu: {topic}{extra}\n"
+            caption=(f"✅ Tayyor! 📊 {real_count} slayd\n🎯 Mavzu: {topic}{extra}\n"
                      "🗣 Har slaydda ma'ruzachi uchun izohlar (Notes) bor.\n\n"
                      "Pastdagi tugmalar bilan tahrirlash, dizaynni almashtirish yoki PDF olish mumkin."),
             reply_markup=deck_kb(did),
@@ -2305,6 +2591,7 @@ async def got_document(m: Message, state: FSMContext):
     topic = ((m.caption or "").strip() or name.rsplit(".", 1)[0].replace("_", " "))[:200]
     if len(topic) < 3:
         topic = "Hujjat asosida taqdimot"
+    await state.set_state(None)
     await state.set_data({"topic": topic, "source": src})
     await safe_edit(wait, f"📄 Fayl o'qildi: <b>{html.escape(name)}</b> ({len(src)} belgi)\n"
                           f"📝 Mavzu: <b>{html.escape(topic)}</b>\n\n📊 Nechta slayd kerak?",
@@ -2807,6 +3094,15 @@ async def pay_card(c: CallbackQuery, state: FSMContext):
 @router.message(Form.receipt, F.photo)
 async def got_receipt(m: Message, state: FSMContext):
     uid = m.from_user.id
+    # Spam himoyasi: bitta foydalanuvchining kutilayotgan cheklari 3 tadan oshmasin
+    with closing(db()) as c:
+        pend = c.execute("SELECT COUNT(*) FROM payments WHERE user_id=? AND kind='card' "
+                         "AND status='pending'", (uid,)).fetchone()[0]
+    if pend >= 3:
+        await state.clear()
+        await m.answer("⏳ Sizning 3 ta chekingiz hali tekshirilmoqda. Iltimos, admin javobini kuting.",
+                       reply_markup=main_kb())
+        return
     i = (await state.get_data()).get("pack", 0)
     n, _, s = PACKS[i]
     file_id = m.photo[-1].file_id
@@ -2924,9 +3220,13 @@ async def main():
     bot = Bot(BOT_TOKEN)
     BOT_USERNAME = (await bot.get_me()).username
     dp = Dispatcher(storage=SQLiteStorage())
+    spam = AntiSpam()                       # spam himoyasi (xabar va tugma bosishlar uchun)
+    dp.message.outer_middleware(spam)
+    dp.callback_query.outer_middleware(spam)
     dp.include_router(router)
     await bot.set_my_commands([
         BotCommand(command="new", description="📊 Yangi taqdimot"),
+        BotCommand(command="bonus", description="🎉 Kunlik bonus"),
         BotCommand(command="history", description="🗂 Oldingi taqdimotlar"),
         BotCommand(command="balance", description="💎 Balans"),
         BotCommand(command="invite", description="🎁 Do'st taklif qilish"),
@@ -2936,7 +3236,11 @@ async def main():
     ])
     await bot.delete_webhook(drop_pending_updates=False)  # eski xabarlar saqlansin
     await notify_missed(bot)
-    log.info("Bot ishga tushdi (PDF: %s, Gemini kalitlari: %d)", "bor" if PDF_OK else "yo'q", len(GEMINI_KEYS))
+    task = asyncio.create_task(backup_loop(bot))          # avtomatik zaxira
+    bg_tasks.add(task)
+    task.add_done_callback(bg_tasks.discard)
+    log.info("Bot ishga tushdi (PDF: %s, Gemini kalitlari: %d, zaxira: har %s soat)",
+             "bor" if PDF_OK else "yo'q", len(GEMINI_KEYS), BACKUP_HOURS)
     await dp.start_polling(bot)
 
 
