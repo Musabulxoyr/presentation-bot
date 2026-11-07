@@ -857,7 +857,8 @@ async def gemini(prompt: str) -> str:
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7,
-                             "maxOutputTokens": 16384},  # katta (20-30 slaydli) taqdimotlar uchun
+                             "maxOutputTokens": 16384,  # katta (20-30 slaydli) taqdimotlar uchun
+                             "thinkingConfig": {"thinkingBudget": 0}},  # "o'ylash"ni o'chiramiz: ancha tez
     }
     errors = []
     dead = set()
@@ -870,14 +871,19 @@ async def gemini(prompt: str) -> str:
                 order.append(m)
         for model in order[:8]:
             bad_model = False
+            mbody = {**body, "generationConfig": dict(body["generationConfig"])}
             for key in keys:
                 if key in dead:
                     continue
                 for attempt in range(2):
-                    kind, val = await call_gemini(session, model, key, body)
+                    kind, val = await call_gemini(session, model, key, mbody)
                     if kind == "ok":
                         return val
                     errors.append(val)
+                    if (kind == "model" and "thinking" in val.lower()
+                            and "thinkingConfig" in mbody["generationConfig"]):
+                        mbody["generationConfig"].pop("thinkingConfig")  # bu model o'chirishni qabul qilmadi
+                        continue
                     if kind == "key":
                         dead.add(key)  # kalit xato: boshqa kalitga o't
                         break
@@ -1161,9 +1167,9 @@ async def fetch_image(session, query):
 
 async def fetch_all_images(slides):
     """Faqat oddiy (bullets) slaydlar uchun rasm qidiradi; grafik/jadval slaydlarga rasm kerak emas."""
-    timeout = aiohttp.ClientTimeout(total=25)
+    timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout, headers=UA) as session:
-        sem = asyncio.Semaphore(4)
+        sem = asyncio.Semaphore(8)
 
         async def one(sl):
             if sl.get("type", "bullets") != "bullets":
@@ -1172,6 +1178,33 @@ async def fetch_all_images(slides):
                 return await fetch_image(session, sl.get("image_query", ""))
 
         return await asyncio.gather(*[one(sl) for sl in slides])
+
+
+img_prefetch: dict = {}  # uid -> (slaydlar, vazifa): reja ko'rilayotganda rasmlar fonda yuklanadi
+
+
+def cancel_prefetch(uid: int):
+    item = img_prefetch.pop(uid, None)
+    if item and not item[1].done():
+        item[1].cancel()
+
+
+async def take_prefetched(uid: int, slides):
+    """Fonda yuklangan rasmlarni oladi; reja o'zgargan bo'lsa qaytadan qidiradi."""
+    t0 = time.monotonic()
+    item = img_prefetch.pop(uid, None)
+    res = None
+    if item and item[0] == slides:
+        try:
+            res = await item[1]
+        except Exception:
+            res = None
+    elif item and not item[1].done():
+        item[1].cancel()
+    if res is None:
+        res = await fetch_all_images(slides)
+    log.info("Rasmlar tayyor: %.1f soniya", time.monotonic() - t0)
+    return res
 
 
 def prep_logo(raw: bytes) -> bytes:
@@ -1991,6 +2024,7 @@ async def send_deck(msg: Message, uid: int, did: int, note: str = "", theme=None
 
 # =================================== HANDLERLAR ===================================
 async def ask_topic(m: Message, state: FSMContext):
+    cancel_prefetch(m.from_user.id)
     await state.clear()
     await state.set_state(Form.topic)
     await m.answer(
@@ -2438,15 +2472,20 @@ async def make_plan(c: CallbackQuery, state: FSMContext, d: dict, regen: int):
     """Reja yaratadi (yoki qayta yaratadi) va tasdiqlash uchun ko'rsatadi."""
     uid = c.from_user.id
     busy_users.add(uid)
+    cancel_prefetch(uid)
     status = await c.message.edit_text(
         f"⏳ <b>{html.escape(d['topic'])}</b> bo'yicha reja tayyorlanmoqda...", parse_mode="HTML")
     try:
         async with gen_slot(status):
             await safe_edit(status, f"⏳ <b>{html.escape(d['topic'])}</b> bo'yicha reja tayyorlanmoqda...",
                             parse_mode="HTML")
+            t0 = time.monotonic()
             content = await generate_content(d["topic"], d["count"], d["lang"], d.get("source", ""))
+            log.info("Reja AI vaqti: %.1f soniya (%s slayd)", time.monotonic() - t0, d["count"])
         await state.update_data(content=content, regen=regen)
         await show_plan(status, content, regen)
+        if (await state.get_data()).get("want_images"):  # foydalanuvchi rejani o'qiguncha rasmlar yuklanadi
+            img_prefetch[uid] = (content["slides"], asyncio.create_task(fetch_all_images(content["slides"])))
     except Exception as e:
         log.exception("Reja xatosi")
         await safe_edit(status, err_text(e))
@@ -2494,6 +2533,7 @@ async def plan_redo(c: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "plan:no")
 async def plan_no(c: CallbackQuery, state: FSMContext):
+    cancel_prefetch(c.from_user.id)
     await state.clear()
     await c.message.edit_text("❌ Bekor qilindi. Yangi taqdimot uchun /new ni bosing.")
     await c.answer()
@@ -2530,7 +2570,7 @@ async def plan_ok(c: CallbackQuery, state: FSMContext):
             images = None
             if want_images:
                 await safe_edit(status, "🖼 Rasmlar qidirilmoqda...")
-                images = await fetch_all_images(content["slides"])
+                images = await take_prefetched(uid, content["slides"])
             found = sum(1 for x in (images or []) if x)
             await safe_edit(status, "🛠 Fayl yig'ilmoqda...")
             path = await render_file(content, theme, style, lang, uid, images)
