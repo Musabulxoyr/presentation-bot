@@ -329,6 +329,26 @@ def add_credits(uid: int, n: int):
         c.commit()
 
 
+def reserve_credit(uid: int) -> bool:
+    """Generatsiya BOSHLANISHIDAN OLDIN 1 ta limitni atomik yechadi. Yetmasa False."""
+    if uid == ADMIN_ID:
+        return True
+    with closing(db()) as c:
+        cur = c.execute("UPDATE users SET credits=credits-1 WHERE user_id=? AND credits>0", (uid,))
+        c.commit()
+        ok = cur.rowcount == 1
+    log.info("Limit yechildi: uid=%s ok=%s", uid, ok)
+    return ok
+
+
+def refund_credit(uid: int):
+    """Generatsiya muvaffaqiyatsiz bo'lsa, yechilgan limitni qaytaradi."""
+    if uid == ADMIN_ID:
+        return
+    add_credits(uid, 1)
+    log.info("Limit qaytarildi: uid=%s", uid)
+
+
 def get_money(uid: int) -> int:
     """Foydalanuvchining bot ichidagi so'm balansi (faqat bot ichida ishlatiladi)."""
     ensure_user(uid)
@@ -392,7 +412,7 @@ def consume(uid: int):
     if uid == ADMIN_ID:
         return None
     with closing(db()) as c:
-        c.execute("UPDATE users SET credits=MAX(credits-1,0), made=made+1 WHERE user_id=?", (uid,))
+        c.execute("UPDATE users SET made=made+1 WHERE user_id=?", (uid,))  # limit oldindan yechilgan (reserve_credit)
         row = c.execute("SELECT referrer, ref_paid FROM users WHERE user_id=?", (uid,)).fetchone()
         c.commit()
     if row and row["referrer"] and not row["ref_paid"]:
@@ -2561,7 +2581,13 @@ async def plan_ok(c: CallbackQuery, state: FSMContext):
     content, want_images = d["content"], bool(d.get("want_images"))
     if style == "random":
         style = random.choice(STYLE_KEYS)
+    if not reserve_credit(uid):  # limit shu yerda yechiladi (poyga holatlarini oldini oladi)
+        await c.answer()
+        await state.clear()
+        await show_paywall(c.message)
+        return
     busy_users.add(uid)
+    sent = False
     await c.answer()
     status = await c.message.edit_text(
         f"⏳ <b>{html.escape(topic)}</b> taqdimoti yig'ilmoqda...", parse_mode="HTML")
@@ -2582,7 +2608,7 @@ async def plan_ok(c: CallbackQuery, state: FSMContext):
         if want_images:
             extra += f"\n🖼 Rasmlar: {found} ta"
         if not is_admin(uid):
-            extra += f"\n💎 Qolgan limit: {max(get_credits(uid) - 1, 0)} ta"
+            extra += f"\n💎 Qolgan limit: {max(get_credits(uid), 0)} ta"
         real_count = len(content["slides"]) + 2  # AI kam slayd qaytargan bo'lishi mumkin
         await c.message.answer_document(
             FSInputFile(path, filename=safe_name(topic)),
@@ -2591,7 +2617,8 @@ async def plan_ok(c: CallbackQuery, state: FSMContext):
                      "Pastdagi tugmalar bilan tahrirlash, dizaynni almashtirish yoki PDF olish mumkin."),
             reply_markup=deck_kb(did),
         )
-        ref = consume(uid)  # limit faqat muvaffaqiyatli yuborilgandan keyin kamayadi
+        sent = True
+        ref = consume(uid)  # statistika va referal bonus
         if ref:
             try:
                 await c.bot.send_message(
@@ -2615,6 +2642,8 @@ async def plan_ok(c: CallbackQuery, state: FSMContext):
         log.exception("Generatsiya xatosi")
         await safe_edit(status, err_text(e))
     finally:
+        if not sent:
+            refund_credit(uid)  # fayl yuborilmadi: limit qaytariladi
         busy_users.discard(uid)
         await state.clear()
         rm(path)
@@ -3229,6 +3258,7 @@ async def admin_decide(c: CallbackQuery):
         return
     uid = row["user_id"]
     n = row["credits"] or 1
+    log.info("Chek #%s %s: uid=%s +%s", pid, "TASDIQLANDI" if ok else "RAD", uid, n)
     try:
         if ok:
             add_credits(uid, n)
