@@ -86,6 +86,10 @@ THEMES = {
     "dark":   ("⚫️ Qora",       "0F172A", "38BDF8", "1E293B", "F1F5F9"),
 }
 
+# Har bir temaning maketi: classic (tepada yo'l), side (chapda panel), minimal (yo'lsiz)
+STYLE_OF = {"blue": "classic", "green": "side", "purple": "minimal",
+            "orange": "side", "red": "classic", "dark": "minimal"}
+
 router = Router()
 busy_users: set[int] = set()
 
@@ -472,6 +476,7 @@ def text(slide, x, y, w, h, t, size, color, bold=False, align=PP_ALIGN.LEFT,
 
 def build_pptx(data, theme_key, lang, path, images=None):
     _, dark, accent, light, txt = THEMES[theme_key]
+    style = STYLE_OF.get(theme_key, "classic")
     on_dark = "FFFFFF"
     prs = Presentation()
     prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
@@ -482,41 +487,79 @@ def build_pptx(data, theme_key, lang, path, images=None):
 
     # --- Titul ---
     s = prs.slides.add_slide(blank)
-    set_bg(s, dark)
-    rect(s, 0, 0, Inches(0.35), H, accent)
-    rect(s, W - Inches(3.2), Inches(-1.2), Inches(4.2), Inches(4.2), accent, MSO_SHAPE.OVAL)
-    rect(s, W - Inches(2.2), Inches(5.3), Inches(3.0), Inches(3.0), accent, MSO_SHAPE.OVAL)
-    rect(s, Inches(1.2), Inches(4.4), Inches(2.2), Inches(0.08), accent)
-    text(s, Inches(1.2), Inches(1.7), Inches(9.0), Inches(2.6), data.get("title", ""), 46,
-         on_dark, True, anchor=MSO_ANCHOR.BOTTOM)
-    text(s, Inches(1.2), Inches(4.65), Inches(9.0), Inches(1.2), data.get("subtitle", ""), 22,
-         "D1D5DB")
+    if style == "classic":
+        set_bg(s, dark)
+        rect(s, 0, 0, Inches(0.35), H, accent)
+        rect(s, W - Inches(3.2), Inches(-1.2), Inches(4.2), Inches(4.2), accent, MSO_SHAPE.OVAL)
+        rect(s, W - Inches(2.2), Inches(5.3), Inches(3.0), Inches(3.0), accent, MSO_SHAPE.OVAL)
+        rect(s, Inches(1.2), Inches(4.4), Inches(2.2), Inches(0.08), accent)
+        text(s, Inches(1.2), Inches(1.7), Inches(9.0), Inches(2.6), data.get("title", ""),
+             46, on_dark, True, anchor=MSO_ANCHOR.BOTTOM)
+        text(s, Inches(1.2), Inches(4.65), Inches(9.0), Inches(1.2), data.get("subtitle", ""),
+             22, "D1D5DB")
+    elif style == "side":
+        set_bg(s, dark)
+        rect(s, 0, 0, Inches(4.5), H, accent)
+        rect(s, Inches(-1.0), Inches(4.5), Inches(3.5), Inches(3.5), dark, MSO_SHAPE.OVAL)
+        rect(s, Inches(5.2), Inches(4.1), Inches(2.2), Inches(0.08), accent)
+        text(s, Inches(5.2), Inches(1.4), Inches(7.4), Inches(2.6), data.get("title", ""),
+             42, on_dark, True, anchor=MSO_ANCHOR.BOTTOM)
+        text(s, Inches(5.2), Inches(4.4), Inches(7.4), Inches(1.5), data.get("subtitle", ""),
+             22, "D1D5DB")
+    else:  # minimal
+        set_bg(s, light)
+        rect(s, Inches(1.2), Inches(1.3), Inches(1.4), Inches(0.12), accent)
+        text(s, Inches(1.2), Inches(1.7), Inches(10.8), Inches(2.8), data.get("title", ""),
+             50, dark, True, anchor=MSO_ANCHOR.MIDDLE)
+        text(s, Inches(1.2), Inches(4.7), Inches(10.8), Inches(1.2), data.get("subtitle", ""),
+             22, txt)
+        rect(s, 0, H - Inches(0.5), W, Inches(0.5), dark)
 
     # --- Asosiy slaydlar ---
     for i, sl in enumerate(slides, start=2):
         s = prs.slides.add_slide(blank)
         set_bg(s, light)
-        rect(s, 0, 0, W, Inches(1.35), dark)
-        rect(s, 0, Inches(1.35), W, Inches(0.07), accent)
-        badge = rect(s, Inches(0.55), Inches(0.35), Inches(0.65), Inches(0.65), accent,
-                     MSO_SHAPE.OVAL)
-        tf = badge.text_frame
-        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-        p = tf.paragraphs[0]
-        p.alignment = PP_ALIGN.CENTER
-        r = p.add_run()
-        r.text = str(i - 1)
-        r.font.size, r.font.bold = Pt(18), True
-        r.font.color.rgb = rgb("FFFFFF")
-        text(s, Inches(1.45), Inches(0.1), Inches(11.4), Inches(1.15), sl.get("title", ""), 30,
-             on_dark, True, anchor=MSO_ANCHOR.MIDDLE)
+        title = sl.get("title", "")
+        if style == "classic":
+            rect(s, 0, 0, W, Inches(1.35), dark)
+            rect(s, 0, Inches(1.35), W, Inches(0.07), accent)
+            badge = rect(s, Inches(0.55), Inches(0.35), Inches(0.65), Inches(0.65), accent,
+                         MSO_SHAPE.OVAL)
+            tf = badge.text_frame
+            tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+            p = tf.paragraphs[0]
+            p.alignment = PP_ALIGN.CENTER
+            r = p.add_run()
+            r.text = str(i - 1)
+            r.font.size, r.font.bold = Pt(18), True
+            r.font.color.rgb = rgb("FFFFFF")
+            text(s, Inches(1.45), Inches(0.1), Inches(11.4), Inches(1.15), title, 30,
+                 on_dark, True, anchor=MSO_ANCHOR.MIDDLE)
+            dot_x, text_x, full_w, top = 0.8, 1.2, 11.5, 1.85
+        elif style == "side":
+            rect(s, 0, 0, Inches(3.1), H, dark)
+            rect(s, Inches(3.1), 0, Inches(0.07), H, accent)
+            text(s, Inches(0.35), Inches(0.5), Inches(2.5), Inches(1.2), str(i - 1), 60,
+                 accent, True)
+            text(s, Inches(0.35), Inches(1.9), Inches(2.5), Inches(4.5), title, 26,
+                 on_dark, True)
+            dot_x, text_x, full_w, top = 3.6, 4.0, 9.0, 1.0
+        else:  # minimal
+            text(s, Inches(0.8), Inches(0.3), Inches(1.5), Inches(0.6), f"{i - 1:02d}", 22,
+                 accent, True)
+            text(s, Inches(0.8), Inches(0.8), Inches(11.7), Inches(1.0), title, 32,
+                 dark, True, anchor=MSO_ANCHOR.MIDDLE)
+            rect(s, Inches(0.8), Inches(1.85), Inches(1.2), Inches(0.07), accent)
+            dot_x, text_x, full_w, top = 0.8, 1.2, 11.5, 2.2
 
         img = images[i - 2] if images and images[i - 2] else None
-        text_w = Inches(6.9) if img else Inches(11.5)
         if img:
             rect(s, Inches(8.4), Inches(1.8), Inches(IMG_W + 0.2), Inches(IMG_H + 0.2), accent)
             s.shapes.add_picture(io.BytesIO(img), Inches(8.5), Inches(1.9),
                                  Inches(IMG_W), Inches(IMG_H))
+            text_w = Inches(8.1 - text_x)
+        else:
+            text_w = Inches(full_w if style != "side" else 8.9)
 
         bullets = [b for b in sl.get("bullets", []) if b][:6] or [""]
         n = len(bullets)
@@ -524,13 +567,13 @@ def build_pptx(data, theme_key, lang, path, images=None):
         size = 22 if chars < 260 else 20 if chars < 340 else 18
         if img:
             size -= 2
-        top, avail = Inches(1.85), Inches(4.9)
+        top_i, avail = Inches(top), Inches(6.7 - top)
         step = int(avail / n)
         for j, b in enumerate(bullets):
-            y = top + step * j
-            rect(s, Inches(0.8), y + Inches(0.13), Inches(0.2), Inches(0.2), accent,
+            y = top_i + step * j
+            rect(s, Inches(dot_x), y + Inches(0.13), Inches(0.2), Inches(0.2), accent,
                  MSO_SHAPE.OVAL)
-            text(s, Inches(1.2), y, text_w, step, b, size, txt)
+            text(s, Inches(text_x), y, text_w, step, b, size, txt)
 
         text(s, Inches(11.6), Inches(6.95), Inches(1.4), Inches(0.4), f"{i} / {total}", 12,
              "9CA3AF", align=PP_ALIGN.RIGHT)
@@ -540,7 +583,10 @@ def build_pptx(data, theme_key, lang, path, images=None):
     # --- Yakuniy ---
     s = prs.slides.add_slide(blank)
     set_bg(s, dark)
-    rect(s, W - Inches(0.35), 0, Inches(0.35), H, accent)
+    if style == "side":
+        rect(s, 0, 0, Inches(0.35), H, accent)
+    else:
+        rect(s, W - Inches(0.35), 0, Inches(0.35), H, accent)
     rect(s, Inches(-1.5), Inches(4.8), Inches(4.0), Inches(4.0), accent, MSO_SHAPE.OVAL)
     t1, t2 = THANKS[lang]
     text(s, 0, Inches(2.5), W, Inches(1.6), t1, 44, on_dark, True, PP_ALIGN.CENTER,
