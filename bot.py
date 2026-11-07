@@ -45,7 +45,7 @@ CARD_NUMBER = os.getenv("CARD_NUMBER") or ""      # karta raqami, masalan 8600 1
 CARD_OWNER = os.getenv("CARD_OWNER") or ""        # karta egasi ismi
 DB_PATH = os.getenv("DB_PATH") or "bot.db"        # Railway'da Volume ulasangiz: /data/bot.db
 
-FREE_LIMIT = 5      # har bir yangi foydalanuvchiga bepul taqdimotlar soni
+FREE_LIMIT = 3      # har bir yangi foydalanuvchiga bepul taqdimotlar soni
 # Balansni to'ldirish paketlari: (taqdimotlar soni, Stars narxi, so'm narxi)
 PACKS = [
     (1, 15, 3000),
