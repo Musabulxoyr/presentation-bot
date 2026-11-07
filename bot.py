@@ -68,7 +68,10 @@ PEXELS_KEY = os.getenv("PEXELS_API_KEY") or ""  # ixtiyoriy; bo'sh bo'lsa Wikime
 ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)      # sizning Telegram ID raqamingiz (@userinfobot dan oling)
 CARD_NUMBER = os.getenv("CARD_NUMBER") or ""      # karta raqami
 CARD_OWNER = os.getenv("CARD_OWNER") or ""        # karta egasi ismi
-DB_PATH = os.getenv("DB_PATH") or "bot.db"        # Railway'da Volume ulasangiz: /data/bot.db
+# Railway'da Volume ulansa, RAILWAY_VOLUME_MOUNT_PATH avtomatik beriladi: baza shu yerda saqlanadi
+_VOL = os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or ""
+DB_PATH = os.getenv("DB_PATH") or (os.path.join(_VOL, "bot.db") if _VOL else "bot.db")  # qo'lda: /data/bot.db
+PERSISTENT_DB = bool(os.getenv("DB_PATH") or _VOL)  # False bo'lsa baza deployda o'chib ketadi!
 
 FREE_LIMIT = 3          # har bir yangi foydalanuvchiga bepul taqdimotlar soni
 FEEDBACK_RATE = 0.3     # har 10 ta taqdimotdan ~3 tasidan keyin fikr so'raladi (sinash uchun 1.0 qiling)
@@ -3352,13 +3355,24 @@ async def main():
         BotCommand(command="help", description="ℹ️ Yordam"),
         BotCommand(command="cancel", description="❌ Bekor qilish"),
     ])
+    if ADMIN_ID and not PERSISTENT_DB:
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                "⚠️ <b>Diqqat:</b> baza doimiy joyda emas (Volume ulanmagan).\n"
+                "Har deploydan keyin foydalanuvchilar, limitlar va to'lovlar o'chib ketadi!\n\n"
+                "Tuzatish: Railway'da Volume qo'shing (mount path: <code>/data</code>) va "
+                "Variables ga <code>DB_PATH=/data/bot.db</code> yozing.",
+                parse_mode="HTML")
+        except Exception as e:
+            log.warning("Volume ogohlantirishi ketmadi: %s", e)
     await bot.delete_webhook(drop_pending_updates=False)  # eski xabarlar saqlansin
     await notify_missed(bot)
     task = asyncio.create_task(backup_loop(bot))          # avtomatik zaxira
     bg_tasks.add(task)
     task.add_done_callback(bg_tasks.discard)
-    log.info("Bot ishga tushdi (PDF: %s, Gemini kalitlari: %d, zaxira: har %s soat)",
-             "bor" if PDF_OK else "yo'q", len(GEMINI_KEYS), BACKUP_HOURS)
+    log.info("Bot ishga tushdi (PDF: %s, Gemini kalitlari: %d, zaxira: har %s soat, baza: %s, doimiy: %s)",
+             "bor" if PDF_OK else "yo'q", len(GEMINI_KEYS), BACKUP_HOURS, DB_PATH, PERSISTENT_DB)
     await dp.start_polling(bot)
 
 
