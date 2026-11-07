@@ -39,7 +39,8 @@ PEXELS_KEY = os.getenv("PEXELS_API_KEY") or ""  # ixtiyoriy; bo'sh bo'lsa Wikime
 DEBUG = True  # xato sababini chatda ko'rsatadi; hammasi ishlab ketsa False qiling
 # =================================================================================
 
-MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"]  # biri band bo'lsa keyingisi
+MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-flash-latest", "gemini-2.5-flash"]  # biri ishlamasa keyingisi
+_discovered: list | None = None
 UA = {"User-Agent": "AISlaydBot/1.0 (telegram bot)"}
 
 logging.basicConfig(level=logging.INFO)
@@ -110,15 +111,45 @@ def images_kb():
 
 
 # ==================================== AI ====================================
+async def discover_models(session) -> list:
+    """Google'dan hozir mavjud flash modellarni so'raydi (nomlar o'zgarib turadi)."""
+    global _discovered
+    if _discovered is not None:
+        return _discovered
+    out = []
+    try:
+        async with session.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            params={"pageSize": 200}, headers={"x-goog-api-key": GEMINI_KEY},
+        ) as r:
+            j = await r.json()
+        bad = ("image", "tts", "live", "audio", "embedding", "robotics", "computer", "native")
+        for m in j.get("models", []):
+            name = m.get("name", "").split("/")[-1]
+            if ("generateContent" in m.get("supportedGenerationMethods", [])
+                    and "flash" in name and not any(x in name for x in bad)):
+                out.append(name)
+    except Exception as e:
+        log.warning("Modellar ro'yxati olinmadi: %s", e)
+    out.sort(reverse=True)
+    _discovered = out
+    log.info("Mavjud modellar: %s", out)
+    return out
+
+
 async def gemini(prompt: str) -> str:
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.7},
     }
-    last = "noma'lum xato"
+    errors = []
     timeout = aiohttp.ClientTimeout(total=150)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for model in MODELS:
+        order = []
+        for m in [os.getenv("AI_MODEL", "")] + MODELS + await discover_models(session):
+            if m and m not in order:
+                order.append(m)
+        for model in order[:8]:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             for attempt in range(2):
                 try:
@@ -127,17 +158,21 @@ async def gemini(prompt: str) -> str:
                         j = await r.json()
                         if r.status == 200:
                             parts = j["candidates"][0]["content"]["parts"]
-                            return "".join(p.get("text", "") for p in parts)
+                            txt = "".join(p.get("text", "") for p in parts)
+                            if txt.strip():
+                                return txt
+                            errors.append(f"{model}: bo'sh javob")
+                            break
                         msg = j.get("error", {}).get("message", str(j))
-                        last = f"{model} [{r.status}]: {msg}"
-                        if r.status in (400, 401, 403):
-                            raise RuntimeError(last)  # kalit/so'rov xato, boshqa model yordam bermaydi
-                        if r.status == 404:
-                            break  # model yo'q, keyingisiga o't
+                        errors.append(f"{model} [{r.status}]: {msg[:120]}")
+                        if r.status in (401, 403) or (r.status == 400 and "API key" in msg):
+                            raise RuntimeError(errors[-1])  # kalit xato: boshqa model yordam bermaydi
+                        if r.status in (400, 404):
+                            break  # bu model yaroqsiz, keyingisiga o't
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    last = f"{model}: {type(e).__name__}"
+                    errors.append(f"{model}: {type(e).__name__}")
                 await asyncio.sleep(3 * (attempt + 1))
-    raise RuntimeError(last)
+    raise RuntimeError(" | ".join(errors[-3:]) or "noma'lum xato")
 
 
 def extract_json(text: str) -> dict:
@@ -528,13 +563,55 @@ async def fallback(m: Message, state: FSMContext):
     await take_topic(m, state)
 
 
+async def notify_missed(bot: Bot):
+    """Bot o'chiq paytda yozgan foydalanuvchilarni topib, 'tuzatildi' deb xabar beradi.
+    Telegram bunday xabarlarni ~24 soat saqlaydi."""
+    users = {}
+    offset = None
+    for _ in range(30):
+        try:
+            ups = await bot.get_updates(offset=offset, limit=100, timeout=0,
+                                        allowed_updates=["message", "callback_query"])
+        except Exception as e:
+            log.warning("Kutilayotgan xabarlarni o'qib bo'lmadi: %s", e)
+            break
+        if not ups:
+            break
+        for u in ups:
+            if u.message and u.message.from_user:
+                user, chat = u.message.from_user, u.message.chat.id
+            elif u.callback_query and u.callback_query.message:
+                user, chat = u.callback_query.from_user, u.callback_query.message.chat.id
+            else:
+                continue
+            if not user.is_bot:
+                users[chat] = user
+        offset = ups[-1].update_id + 1  # keyingi so'rov bularni "o'qilgan" qilib qo'yadi
+
+    sent = 0
+    for chat_id in users:
+        try:
+            await bot.send_message(
+                chat_id,
+                "✅ Kechirasiz, bot vaqtincha ishlamay turgan edi.\n"
+                "Muammo tuzatildi, endi hammasi ishlayapti!\n\n"
+                "📊 Taqdimot yaratish uchun /new ni bosing.",
+            )
+            sent += 1
+        except Exception as e:  # foydalanuvchi botni bloklagan bo'lishi mumkin
+            log.warning("Xabar yuborilmadi (%s): %s", chat_id, e)
+        await asyncio.sleep(0.05)
+    log.info("O'tkazib yuborilgan foydalanuvchilarga xabar: %s ta", sent)
+
+
 async def main():
     if BOT_TOKEN.startswith("BOT_TOKEN_NI") or GEMINI_KEY.startswith("GEMINI_KALIT"):
         raise SystemExit("❗ BOT_TOKEN va GEMINI_API_KEY ni kiriting (faylning yuqori qismida)")
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.delete_webhook(drop_pending_updates=False)  # eski xabarlar saqlansin
+    await notify_missed(bot)
     log.info("Bot ishga tushdi")
     await dp.start_polling(bot)
 
