@@ -17,6 +17,7 @@ Imkoniyatlar:
   - YANGI: SPAM himoyasi (juda tez bosgan/yozganni vaqtincha to'xtatadi)
   - YANGI: avtomatik ZAXIRA (bazani adminga yuboradi) + /backup
   - YANGI: kunlik BONUS (150 so'm) + "Kunlik bonus" tugmasi va /bonus
+  - YANGI: karta to'lovida chek skrinshot YOKI PDF ko'rinishida qabul qilinadi
 
 O'rnatish:  pip install -r requirements.txt
 PDF uchun serverda LibreOffice kerak (nixpacks.toml ga qarang); bo'lmasa PDF tugmasi chiqmaydi.
@@ -2334,6 +2335,7 @@ async def show_paywall(m: Message):
         "😔 <b>Bepul limitingiz tugadi.</b>\n\n"
         "➕ Davom etish uchun balansni to'ldiring, do'stlaringizni taklif qiling (/invite) "
         f"yoki har kuni /bonus orqali +{som(BONUS_SOM)} so'm yig'ing.\n"
+        "💳 Karta orqali to'lasangiz, chekni <b>skrinshot</b> yoki <b>PDF</b> ko'rinishida yuborishingiz kifoya.\n"
         "Paketni tanlang:",
         parse_mode="HTML", reply_markup=packs_kb())
 
@@ -2621,6 +2623,13 @@ async def plan_ok(c: CallbackQuery, state: FSMContext):
 # ---------- Fayldan taqdimot ----------
 @router.message(F.document)
 async def got_document(m: Message, state: FSMContext):
+    # Boshqa holatda (chek yoki logo) yuborilgan fayl bo'lsa, tegishli handlerga uzatamiz
+    cur = await state.get_state()
+    if cur == Form.receipt.state:      # chek PDF/hujjat ko'rinishida yuborilgan
+        return await got_receipt(m, state)
+    if cur == Form.logo.state:         # logo fayl sifatida yuborilgan
+        return await got_logo(m, state)
+
     doc = m.document
     name = doc.file_name or "fayl"
     ext = name.lower().rsplit(".", 1)[-1] if "." in name else ""
@@ -3147,13 +3156,13 @@ async def pay_card(c: CallbackQuery, state: FSMContext):
     await c.message.answer(
         f"💳 <b>{som(s)} so'm</b> ({n} ta taqdimot) ni shu kartaga o'tkazing:\n\n"
         f"<code>{CARD_NUMBER}</code>\n👤 {html.escape(CARD_OWNER)}\n\n"
-        "O'tkazgach <b>chek rasmini (skrinshot)</b> shu yerga yuboring.\n"
+        "O'tkazgach <b>chek skrinshoti yoki PDF faylini</b> shu yerga yuboring.\n"
         "🙏 Kechirasiz, karta to'lovini admin qo'lda tekshiradi, shuning uchun "
         "tasdiqlanishi biroz vaqt olishi mumkin.\n\nBekor qilish: /cancel",
         parse_mode="HTML")
 
 
-@router.message(Form.receipt, F.photo)
+@router.message(Form.receipt, F.photo | F.document)
 async def got_receipt(m: Message, state: FSMContext):
     uid = m.from_user.id
     # Spam himoyasi: bitta foydalanuvchining kutilayotgan cheklari 3 tadan oshmasin
@@ -3165,18 +3174,35 @@ async def got_receipt(m: Message, state: FSMContext):
         await m.answer("⏳ Sizning 3 ta chekingiz hali tekshirilmoqda. Iltimos, admin javobini kuting.",
                        reply_markup=main_kb())
         return
+
+    # Chek: skrinshot (photo) yoki PDF / rasm fayli (document)
+    if m.photo:
+        file_id, is_photo = m.photo[-1].file_id, True
+    else:
+        doc = m.document
+        mime = doc.mime_type or ""
+        if mime != "application/pdf" and not mime.startswith("image/"):
+            await m.answer("📸 Chekni <b>skrinshot</b> yoki <b>PDF</b> ko'rinishida yuboring "
+                           "yoki /cancel bosing.", parse_mode="HTML")
+            return
+        if (doc.file_size or 0) > 10 * 1024 * 1024:
+            await m.answer("⚠️ Fayl katta (10 MB gacha bo'lsin).")
+            return
+        file_id, is_photo = doc.file_id, False
+
     i = (await state.get_data()).get("pack", 0)
     n, _, s = PACKS[i]
-    file_id = m.photo[-1].file_id
     pid = new_payment(uid, "card", s, "pending", file_id, n)
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Tasdiqlash", callback_data=f"adm:ok:{pid}")
     kb.button(text="❌ Rad etish", callback_data=f"adm:no:{pid}")
     kb.adjust(2)
-    await m.bot.send_photo(
-        ADMIN_ID, file_id, reply_markup=kb.as_markup(),
-        caption=f"💳 To'lov so'rovi #{pid}\n👤 {m.from_user.full_name} (id {uid})\n"
-                f"💰 {som(s)} so'm → {n} ta taqdimot")
+    cap = (f"💳 To'lov so'rovi #{pid}\n👤 {m.from_user.full_name} (id {uid})\n"
+           f"💰 {som(s)} so'm → {n} ta taqdimot" + ("" if is_photo else "\n📄 Chek PDF/fayl ko'rinishida"))
+    if is_photo:
+        await m.bot.send_photo(ADMIN_ID, file_id, reply_markup=kb.as_markup(), caption=cap)
+    else:
+        await m.bot.send_document(ADMIN_ID, file_id, reply_markup=kb.as_markup(), caption=cap)
     await state.clear()
     await m.answer("🙏 Kechirasiz, chekingizni admin tekshirishi kerak.\n"
                    "Iltimos, biroz kuting. Tasdiqlangach balansingiz to'ldiriladi "
@@ -3186,8 +3212,8 @@ async def got_receipt(m: Message, state: FSMContext):
 
 @router.message(Form.receipt)
 async def receipt_not_photo(m: Message):
-    await m.answer("📸 Iltimos, chek <b>rasmini</b> yuboring yoki /cancel bosing.",
-                   parse_mode="HTML")
+    await m.answer("📸 Iltimos, chekni <b>skrinshot</b> yoki <b>PDF</b> ko'rinishida yuboring "
+                   "yoki /cancel bosing.", parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("adm:"))
