@@ -15,7 +15,10 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import tempfile
+import time
+from contextlib import closing
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
@@ -23,7 +26,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, FSInputFile, Message
+from aiogram.types import (CallbackQuery, FSInputFile, LabeledPrice, Message,
+                           PreCheckoutQuery)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from PIL import Image
 from pptx import Presentation
@@ -36,6 +40,16 @@ from pptx.util import Inches, Pt
 BOT_TOKEN = os.getenv("BOT_TOKEN") or "BOT_TOKEN_NI_SHU_YERGA"
 GEMINI_KEY = os.getenv("GEMINI_API_KEY") or "GEMINI_KALITNI_SHU_YERGA"
 PEXELS_KEY = os.getenv("PEXELS_API_KEY") or ""  # ixtiyoriy; bo'sh bo'lsa Wikimedia ishlatiladi
+ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)      # sizning Telegram ID raqamingiz (@userinfobot dan oling)
+CARD_NUMBER = os.getenv("CARD_NUMBER") or ""      # karta raqami, masalan 8600 1234 5678 9012
+CARD_OWNER = os.getenv("CARD_OWNER") or ""        # karta egasi ismi
+DB_PATH = os.getenv("DB_PATH") or "bot.db"        # Railway'da Volume ulasangiz: /data/bot.db
+
+FREE_LIMIT = 5      # har bir yangi foydalanuvchiga bepul taqdimotlar soni
+PACK_SIZE = 1       # bitta to'lov necha taqdimot beradi
+STARS_PRICE = 15    # Telegram Stars narxi
+SOM_PRICE = 3000    # so'mdagi narx (kartaga)
+
 DEBUG = True  # xato sababini chatda ko'rsatadi; hammasi ishlab ketsa False qiling
 # =================================================================================
 
@@ -75,6 +89,74 @@ busy_users: set[int] = set()
 
 class Form(StatesGroup):
     topic = State()
+    receipt = State()
+
+
+# ================================ BAZA (limit) ================================
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init_db():
+    with closing(db()) as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY, name TEXT, credits INTEGER NOT NULL,
+            made INTEGER NOT NULL DEFAULT 0, created INTEGER);
+        CREATE TABLE IF NOT EXISTS payments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, kind TEXT,
+            amount INTEGER, status TEXT, receipt TEXT, ts INTEGER);
+        """)
+        c.commit()
+
+
+def get_credits(uid: int, name: str = "") -> int:
+    if uid == ADMIN_ID:
+        return 10**6  # admin cheksiz
+    with closing(db()) as c:
+        c.execute("INSERT OR IGNORE INTO users(user_id,name,credits,created) VALUES(?,?,?,?)",
+                  (uid, name, FREE_LIMIT, int(time.time())))
+        c.commit()
+        return c.execute("SELECT credits FROM users WHERE user_id=?", (uid,)).fetchone()[0]
+
+
+def add_credits(uid: int, n: int):
+    get_credits(uid)
+    with closing(db()) as c:
+        c.execute("UPDATE users SET credits=credits+? WHERE user_id=?", (n, uid))
+        c.commit()
+
+
+def consume(uid: int):
+    if uid == ADMIN_ID:
+        return
+    with closing(db()) as c:
+        c.execute("UPDATE users SET credits=MAX(credits-1,0), made=made+1 WHERE user_id=?", (uid,))
+        c.commit()
+
+
+def new_payment(uid, kind, amount, status, receipt="") -> int:
+    with closing(db()) as c:
+        cur = c.execute("INSERT INTO payments(user_id,kind,amount,status,receipt,ts) VALUES(?,?,?,?,?,?)",
+                        (uid, kind, amount, status, receipt, int(time.time())))
+        c.commit()
+        return cur.lastrowid
+
+
+def finish_payment(pid: int, status: str):
+    """Faqat 'pending' to'lovni o'zgartiradi (ikki marta tasdiqlanmasligi uchun)."""
+    with closing(db()) as c:
+        cur = c.execute("UPDATE payments SET status=? WHERE id=? AND status='pending'", (status, pid))
+        c.commit()
+        if cur.rowcount == 0:
+            return None
+        return c.execute("SELECT * FROM payments WHERE id=?", (pid,)).fetchone()
+
+
+def som(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
 
 
 # ================================ KLAVIATURALAR ================================
@@ -99,6 +181,15 @@ def theme_kb():
     for key, (name, *_r) in THEMES.items():
         kb.button(text=name, callback_data=f"theme:{key}")
     kb.adjust(2)
+    return kb.as_markup()
+
+
+def pay_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"⭐️ {STARS_PRICE} Stars bilan to'lash", callback_data="pay:stars")
+    if CARD_NUMBER and ADMIN_ID:
+        kb.button(text=f"💳 {som(SOM_PRICE)} so'm (karta)", callback_data="pay:card")
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -449,7 +540,20 @@ async def cmd_help(m: Message):
     )
 
 
+async def show_paywall(m: Message):
+    await m.answer(
+        "😔 <b>Bepul limitingiz tugadi.</b>\n\n"
+        f"Davom etish uchun to'lov qiling, har to'lov <b>+{PACK_SIZE} ta taqdimot</b> beradi:\n"
+        f"⭐️ {STARS_PRICE} Telegram Stars\n"
+        + (f"💳 {som(SOM_PRICE)} so'm (karta orqali)\n" if CARD_NUMBER and ADMIN_ID else ""),
+        parse_mode="HTML", reply_markup=pay_kb())
+
+
 async def take_topic(m: Message, state: FSMContext):
+    if get_credits(m.from_user.id, m.from_user.full_name) <= 0:
+        await state.clear()
+        await show_paywall(m)
+        return
     topic = (m.text or "").strip()
     if len(topic) < 3 or len(topic) > 200:
         await m.answer("⚠️ Mavzu 3 dan 200 belgigacha bo'lishi kerak. Qayta yozing.")
@@ -459,7 +563,7 @@ async def take_topic(m: Message, state: FSMContext):
                    parse_mode="HTML", reply_markup=count_kb())
 
 
-@router.message(Form.topic, F.text)
+@router.message(Form.topic, F.text, ~F.text.startswith("/"))
 async def got_topic(m: Message, state: FSMContext):
     await take_topic(m, state)
 
@@ -512,6 +616,12 @@ async def got_images(c: CallbackQuery, state: FSMContext):
         await c.answer("⏳ Oldingi taqdimot tayyorlanmoqda, kuting...", show_alert=True)
         return
 
+    if get_credits(uid, c.from_user.full_name) <= 0:
+        await c.answer()
+        await state.clear()
+        await show_paywall(c.message)
+        return
+
     want_images = c.data.endswith("yes")
     topic, count, lang, theme = d["topic"], d["count"], d["lang"], d["theme"]
     busy_users.add(uid)
@@ -537,12 +647,15 @@ async def got_images(c: CallbackQuery, state: FSMContext):
 
         safe = re.sub(r"[^\w\-]+", "_", topic)[:40] or "taqdimot"
         extra = f"\n🖼 Rasmlar: {found} ta" if want_images else ""
+        if uid != ADMIN_ID:
+            extra += f"\n💎 Qolgan limit: {max(get_credits(uid) - 1, 0)} ta"
         await c.message.answer_document(
             FSInputFile(path, filename=f"{safe}.pptx"),
             caption=(f"✅ Tayyor! 📊 {count} slayd\n🎯 Mavzu: {topic}{extra}\n"
                      "🗣 Har slaydda ma'ruzachi uchun izohlar (Notes) bor.\n\n"
                      "Yangi taqdimot: /new"),
         )
+        consume(uid)  # limit faqat muvaffaqiyatli yuborilgandan keyin kamayadi
         await status.delete()
     except Exception as e:
         log.exception("Generatsiya xatosi")
@@ -557,7 +670,149 @@ async def got_images(c: CallbackQuery, state: FSMContext):
             os.remove(path)
 
 
-@router.message(F.text)
+# ================================= TO'LOVLAR =================================
+@router.message(Command("balance"))
+async def cmd_balance(m: Message):
+    n = get_credits(m.from_user.id, m.from_user.full_name)
+    if m.from_user.id == ADMIN_ID:
+        await m.answer("👑 Siz adminsiz: cheksiz.")
+    else:
+        await m.answer(f"💎 Sizda <b>{n}</b> ta taqdimot qoldi.", parse_mode="HTML",
+                       reply_markup=pay_kb())
+
+
+@router.callback_query(F.data == "pay:stars")
+async def pay_stars(c: CallbackQuery):
+    await c.answer()
+    await c.message.answer_invoice(
+        title="📊 Taqdimot paketi",
+        description=f"{PACK_SIZE} ta taqdimot yaratish",
+        payload=f"pack:{c.from_user.id}",
+        currency="XTR",  # Telegram Stars
+        prices=[LabeledPrice(label=f"{PACK_SIZE} ta taqdimot", amount=STARS_PRICE)],
+    )
+
+
+@router.pre_checkout_query()
+async def pre_checkout(q: PreCheckoutQuery):
+    await q.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def stars_paid(m: Message):
+    sp = m.successful_payment
+    uid = m.from_user.id
+    new_payment(uid, "stars", sp.total_amount, "paid", sp.telegram_payment_charge_id)
+    add_credits(uid, PACK_SIZE)
+    await m.answer(f"✅ To'lov qabul qilindi! +{PACK_SIZE} ta taqdimot.\n"
+                   f"💎 Jami: {get_credits(uid)} ta\n\n📊 Boshlash: /new")
+    if ADMIN_ID:
+        try:
+            await m.bot.send_message(ADMIN_ID, f"⭐️ {sp.total_amount} Stars to'landi: "
+                                               f"{m.from_user.full_name} (id {uid})")
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data == "pay:card")
+async def pay_card(c: CallbackQuery, state: FSMContext):
+    if not (CARD_NUMBER and ADMIN_ID):
+        await c.answer("Karta orqali to'lov hozircha yo'q", show_alert=True)
+        return
+    await c.answer()
+    await state.set_state(Form.receipt)
+    await c.message.answer(
+        f"💳 <b>{som(SOM_PRICE)} so'm</b> ni shu kartaga o'tkazing:\n\n"
+        f"<code>{CARD_NUMBER}</code>\n👤 {html.escape(CARD_OWNER)}\n\n"
+        "O'tkazgach <b>chek rasmini (skrinshot)</b> shu yerga yuboring. "
+        "Admin tekshirib tasdiqlaydi.\n\nBekor qilish: /cancel",
+        parse_mode="HTML")
+
+
+@router.message(Form.receipt, F.photo)
+async def got_receipt(m: Message, state: FSMContext):
+    uid = m.from_user.id
+    file_id = m.photo[-1].file_id
+    pid = new_payment(uid, "card", SOM_PRICE, "pending", file_id)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Tasdiqlash", callback_data=f"adm:ok:{pid}")
+    kb.button(text="❌ Rad etish", callback_data=f"adm:no:{pid}")
+    kb.adjust(2)
+    await m.bot.send_photo(
+        ADMIN_ID, file_id, reply_markup=kb.as_markup(),
+        caption=f"💳 To'lov so'rovi #{pid}\n👤 {m.from_user.full_name} (id {uid})\n"
+                f"💰 {som(SOM_PRICE)} so'm")
+    await state.clear()
+    await m.answer("✅ Chek adminga yuborildi. Tasdiqlangach xabar keladi.")
+
+
+@router.message(Form.receipt, ~F.text.startswith("/"))
+async def receipt_not_photo(m: Message):
+    await m.answer("📸 Iltimos, chek <b>rasmini</b> yuboring yoki /cancel bosing.",
+                   parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("adm:"))
+async def admin_decide(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        await c.answer("Ruxsat yo'q", show_alert=True)
+        return
+    _, action, pid = c.data.split(":")
+    ok = action == "ok"
+    row = finish_payment(int(pid), "approved" if ok else "rejected")
+    if not row:
+        await c.answer("Bu so'rov allaqachon ko'rib chiqilgan", show_alert=True)
+        return
+    uid = row["user_id"]
+    try:
+        if ok:
+            add_credits(uid, PACK_SIZE)
+            await c.bot.send_message(uid, f"✅ To'lov tasdiqlandi! +{PACK_SIZE} ta taqdimot.\n"
+                                          f"💎 Jami: {get_credits(uid)} ta\n\n📊 Boshlash: /new")
+        else:
+            await c.bot.send_message(uid, "❌ To'lovingiz tasdiqlanmadi. "
+                                          "Chek noto'g'ri bo'lsa, qayta yuboring: /new")
+    except Exception as e:
+        log.warning("Foydalanuvchiga xabar ketmadi: %s", e)
+    await c.message.edit_caption(
+        caption=(c.message.caption or "") + ("\n\n✅ Tasdiqlandi" if ok else "\n\n❌ Rad etildi"),
+        reply_markup=None)
+    await c.answer("Bajarildi")
+
+
+@router.message(Command("stats"))
+async def cmd_stats(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    with closing(db()) as c:
+        users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        made = c.execute("SELECT COALESCE(SUM(made),0) FROM users").fetchone()[0]
+        stars = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payments "
+                          "WHERE kind='stars'").fetchone()
+        card = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payments "
+                         "WHERE kind='card' AND status='approved'").fetchone()
+        pend = c.execute("SELECT COUNT(*) FROM payments WHERE status='pending'").fetchone()[0]
+    await m.answer(
+        f"📈 <b>Statistika</b>\n👥 Foydalanuvchilar: {users}\n📊 Yaratilgan taqdimotlar: {made}\n"
+        f"⭐️ Stars: {stars[0]} ta, jami {stars[1]} ⭐️\n"
+        f"💳 Karta: {card[0]} ta, jami {som(card[1])} so'm\n⏳ Kutilayotgan: {pend}",
+        parse_mode="HTML")
+
+
+@router.message(Command("give"))
+async def cmd_give(m: Message):
+    """Admin: /give <user_id> <son>  - qo'lda limit berish"""
+    if m.from_user.id != ADMIN_ID:
+        return
+    try:
+        _, uid, n = m.text.split()
+        add_credits(int(uid), int(n))
+        await m.answer(f"✅ {uid} ga +{n} ta berildi. Jami: {get_credits(int(uid))}")
+    except Exception:
+        await m.answer("Format: /give 123456789 5")
+
+
+@router.message(F.text, ~F.text.startswith("/"))
 async def fallback(m: Message, state: FSMContext):
     """Holat yo'qolgan bo'lsa (bot qayta ishga tushgan), matnni yangi mavzu deb olamiz."""
     await take_topic(m, state)
@@ -607,6 +862,7 @@ async def notify_missed(bot: Bot):
 async def main():
     if BOT_TOKEN.startswith("BOT_TOKEN_NI") or GEMINI_KEY.startswith("GEMINI_KALIT"):
         raise SystemExit("❗ BOT_TOKEN va GEMINI_API_KEY ni kiriting (faylning yuqori qismida)")
+    init_db()
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
