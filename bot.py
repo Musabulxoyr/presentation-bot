@@ -1,6 +1,7 @@
 """
 📊 AI Slayd Bot (TEKIN versiya)
-Mavzu -> slayd soni -> til -> dizayn -> rasm (ha/yo'q) -> tayyor .pptx
+Mavzu -> slayd soni -> til -> rang -> maket -> rasm (ha/yo'q) -> tayyor .pptx
+Har 10 ta taqdimotdan ~3 tasidan keyin foydalanuvchidan baho/fikr so'raydi va adminga yuboradi.
 
 Hammasi bepul:
   • AI: Google Gemini (bepul kalit: aistudio.google.com/apikey)
@@ -14,6 +15,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 import tempfile
@@ -45,7 +47,8 @@ CARD_NUMBER = os.getenv("CARD_NUMBER") or ""      # karta raqami, masalan 8600 1
 CARD_OWNER = os.getenv("CARD_OWNER") or ""        # karta egasi ismi
 DB_PATH = os.getenv("DB_PATH") or "bot.db"        # Railway'da Volume ulasangiz: /data/bot.db
 
-FREE_LIMIT = 3      # har bir yangi foydalanuvchiga bepul taqdimotlar soni
+FREE_LIMIT = 3          # har bir yangi foydalanuvchiga bepul taqdimotlar soni
+FEEDBACK_RATE = 0.3     # har 10 ta taqdimotdan ~3 tasidan keyin fikr so'raladi (sinash uchun 1.0 qiling)
 # Balansni to'ldirish paketlari: (taqdimotlar soni, Stars narxi, so'm narxi)
 PACKS = [
     (1, 15, 3000),
@@ -86,9 +89,20 @@ THEMES = {
     "dark":   ("⚫️ Qora",       "0F172A", "38BDF8", "1E293B", "F1F5F9"),
 }
 
-# Har bir temaning maketi: classic (tepada yo'l), side (chapda panel), minimal (yo'lsiz)
-STYLE_OF = {"blue": "classic", "green": "side", "purple": "minimal",
-            "orange": "side", "red": "classic", "dark": "minimal"}
+# Slayd maketlari (joylashuv). Rangni THEMES beradi, joylashuvni STYLES.
+STYLES = {
+    "classic":  "📐 Klassik",
+    "side":     "📑 Yon panel",
+    "minimal":  "✨ Minimal",
+    "cards":    "🗂 Kartochkali",
+    "split":    "🖼 Ikki ustunli",
+    "bignum":   "🔢 Katta raqam",
+    "timeline": "🛤 Chiziqli",
+    "gradient": "🌈 Gradient",
+    "magazine": "📰 Jurnal",
+    "random":   "🎲 Tasodifiy",
+}
+STYLE_KEYS = [k for k in STYLES if k != "random"]
 
 router = Router()
 busy_users: set[int] = set()
@@ -97,6 +111,7 @@ busy_users: set[int] = set()
 class Form(StatesGroup):
     topic = State()
     receipt = State()
+    comment = State()
 
 
 # ================================ BAZA (limit) ================================
@@ -131,6 +146,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS payments(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, kind TEXT,
             amount INTEGER, status TEXT, receipt TEXT, ts INTEGER, credits INTEGER);
+        CREATE TABLE IF NOT EXISTS feedback(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, name TEXT, topic TEXT,
+            theme TEXT, style TEXT, score INTEGER, comment TEXT, ts INTEGER);
         """)
         c.commit()
         try:  # eski bazalar uchun
@@ -184,6 +202,32 @@ def finish_payment(pid: int, status: str):
         return c.execute("SELECT * FROM payments WHERE id=?", (pid,)).fetchone()
 
 
+def new_feedback(uid, name, topic, theme, style) -> int:
+    with closing(db()) as c:
+        cur = c.execute("INSERT INTO feedback(user_id,name,topic,theme,style,ts) VALUES(?,?,?,?,?,?)",
+                        (uid, name, topic, theme, style, int(time.time())))
+        c.commit()
+        return cur.lastrowid
+
+
+def set_score(fid: int, uid: int, score: int):
+    """Bahoni faqat bir marta qabul qiladi."""
+    with closing(db()) as c:
+        cur = c.execute("UPDATE feedback SET score=? WHERE id=? AND user_id=? AND score IS NULL",
+                        (score, fid, uid))
+        c.commit()
+        if cur.rowcount == 0:
+            return None
+        return c.execute("SELECT * FROM feedback WHERE id=?", (fid,)).fetchone()
+
+
+def set_comment(fid: int, uid: int, comment: str):
+    with closing(db()) as c:
+        c.execute("UPDATE feedback SET comment=? WHERE id=? AND user_id=?", (comment, fid, uid))
+        c.commit()
+        return c.execute("SELECT * FROM feedback WHERE id=?", (fid,)).fetchone()
+
+
 def som(n: int) -> str:
     return f"{n:,}".replace(",", " ")
 
@@ -225,6 +269,22 @@ def theme_kb():
     for key, (name, *_r) in THEMES.items():
         kb.button(text=name, callback_data=f"theme:{key}")
     kb.adjust(2)
+    return kb.as_markup()
+
+
+def style_kb():
+    kb = InlineKeyboardBuilder()
+    for key, name in STYLES.items():
+        kb.button(text=name, callback_data=f"style:{key}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+def feedback_kb(fid: int):
+    kb = InlineKeyboardBuilder()
+    for n in range(1, 6):
+        kb.button(text=f"{n}⭐️", callback_data=f"fb:{n}:{fid}")
+    kb.adjust(5)
     return kb.as_markup()
 
 
@@ -444,9 +504,34 @@ def rgb(h):
     return RGBColor.from_string(h)
 
 
+def lum(h):
+    """Rang yorqinligi: 0 (qora) ... 1 (oq)."""
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return (0.299 * r + 0.587 * g + 0.114 * b) / 255
+
+
+def mix(a, b, t):
+    """a va b ranglarini aralashtiradi (t=0 -> a, t=1 -> b)."""
+    ca = [int(a[i:i + 2], 16) for i in (0, 2, 4)]
+    cb = [int(b[i:i + 2], 16) for i in (0, 2, 4)]
+    return "".join(f"{round(x + (y - x) * t):02X}" for x, y in zip(ca, cb))
+
+
 def set_bg(slide, color):
     slide.background.fill.solid()
     slide.background.fill.fore_color.rgb = rgb(color)
+
+
+def set_grad(slide, bottom, top):
+    """Gradient fon (pastdan tepaga). Ishlamasa oddiy rangga qaytadi."""
+    try:
+        f = slide.background.fill
+        f.gradient()
+        f.gradient_angle = 90
+        f.gradient_stops[0].color.rgb = rgb(bottom)
+        f.gradient_stops[1].color.rgb = rgb(top)
+    except Exception:
+        set_bg(slide, top)
 
 
 def rect(slide, x, y, w, h, color, shape=MSO_SHAPE.RECTANGLE):
@@ -474,18 +559,109 @@ def text(slide, x, y, w, h, t, size, color, bold=False, align=PP_ALIGN.LEFT,
     return tb
 
 
-def build_pptx(data, theme_key, lang, path, images=None):
+def badge(slide, x, y, d, label, color, size=16, fg="FFFFFF"):
+    """Ichida raqami bor aylana."""
+    b = rect(slide, x, y, d, d, color, MSO_SHAPE.OVAL)
+    tf = b.text_frame
+    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    p = tf.paragraphs[0]
+    p.alignment = PP_ALIGN.CENTER
+    r = p.add_run()
+    r.text = str(label)
+    r.font.size = Pt(size)
+    r.font.bold = True
+    r.font.name = "Calibri"
+    r.font.color.rgb = rgb(fg)
+    return b
+
+
+def fit_size(bullets, w, h, start):
+    """Matn berilgan joyga sig'adigan eng katta shriftni tanlaydi (taxminan)."""
+    for size in range(start, 11, -1):
+        cpl = max(1, int((w - 0.25) * 72 / (size * 0.52)))  # bir qatordagi belgilar soni
+        if all(-(-len(b) // cpl) * size * 1.25 / 72 <= h for b in bullets):
+            return size
+    return 12
+
+
+def bullets_plain(s, bullets, dot_x, text_x, text_w, top, bottom, start, color, accent):
+    n = len(bullets)
+    step = (bottom - top) / n
+    size = fit_size(bullets, text_w, step - 0.05, start)
+    for j, b in enumerate(bullets):
+        y = top + step * j
+        rect(s, Inches(dot_x), Inches(y + 0.13), Inches(0.2), Inches(0.2), accent, MSO_SHAPE.OVAL)
+        text(s, Inches(text_x), Inches(y), Inches(text_w), Inches(step), b, size, color)
+
+
+def bullets_cards(s, bullets, x, w, top, bottom, cols, start, color, accent, card):
+    n = len(bullets)
+    rows = -(-n // cols)
+    gap = 0.25
+    cw = (w - gap * (cols - 1)) / cols
+    ch = ((bottom - top) - gap * (rows - 1)) / rows
+    size = fit_size(bullets, cw - 0.4, ch - 0.1, start)
+    for j, b in enumerate(bullets):
+        r_, c_ = divmod(j, cols)
+        cx = x + c_ * (cw + gap)
+        cy = top + r_ * (ch + gap)
+        rect(s, Inches(cx), Inches(cy), Inches(cw), Inches(ch), card)
+        rect(s, Inches(cx), Inches(cy), Inches(0.1), Inches(ch), accent)
+        text(s, Inches(cx + 0.25), Inches(cy), Inches(cw - 0.4), Inches(ch), b, size, color,
+             anchor=MSO_ANCHOR.MIDDLE)
+
+
+def bullets_timeline(s, bullets, line_x, text_x, text_w, top, bottom, start, color, accent):
+    n = len(bullets)
+    step = (bottom - top) / n
+    size = fit_size(bullets, text_w, step - 0.05, start)
+    if n > 1:
+        rect(s, Inches(line_x - 0.03), Inches(top + 0.25), Inches(0.06),
+             Inches(step * (n - 1)), accent)
+    for j, b in enumerate(bullets):
+        y = top + step * j
+        badge(s, Inches(line_x - 0.25), Inches(y), Inches(0.5), j + 1, accent, 16)
+        text(s, Inches(text_x), Inches(y), Inches(text_w), Inches(step), b, size, color)
+
+
+def bullets_numbered(s, bullets, x, text_x, text_w, top, bottom, start, color, accent):
+    n = len(bullets)
+    step = (bottom - top) / n
+    size = fit_size(bullets, text_w, step - 0.05, start)
+    for j, b in enumerate(bullets):
+        y = top + step * j
+        text(s, Inches(x), Inches(y), Inches(0.9), Inches(0.6), f"{j + 1:02d}", 20, accent, True)
+        text(s, Inches(text_x), Inches(y), Inches(text_w), Inches(step), b, size, color)
+
+
+def put_image(s, img, x, y, w, h, frame, accent):
+    if frame:
+        rect(s, Inches(x), Inches(y), Inches(w + 0.2), Inches(h + 0.2), accent)
+        x, y = x + 0.1, y + 0.1
+    s.shapes.add_picture(io.BytesIO(img), Inches(x), Inches(y), Inches(w), Inches(h))
+
+
+def build_pptx(data, theme_key, style, lang, path, images=None):
     _, dark, accent, light, txt = THEMES[theme_key]
-    style = STYLE_OF.get(theme_key, "classic")
+    if style not in STYLE_KEYS:
+        style = "classic"
     on_dark = "FFFFFF"
+    soft = "D1D5DB"
+    bg_dark = lum(light) < 0.4                       # fon to'q bo'lsa (Qora tema)
+    head_c = "FFFFFF" if bg_dark else dark           # och fondagi sarlavha rangi
+    card = mix(light, "FFFFFF", 0.1) if bg_dark else "FFFFFF"
+    g_bottom, g_top = mix(dark, accent, 0.4), dark   # gradient ranglari
+    g_txt = "F1F5F9"
+
     prs = Presentation()
     prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
     W, H = prs.slide_width, prs.slide_height
     blank = prs.slide_layouts[6]
     slides = data["slides"]
     total = len(slides) + 2
+    title_t, sub_t = data.get("title", ""), data.get("subtitle", "")
 
-    # --- Titul ---
+    # ------------------------------ TITUL ------------------------------
     s = prs.slides.add_slide(blank)
     if style == "classic":
         set_bg(s, dark)
@@ -493,105 +669,243 @@ def build_pptx(data, theme_key, lang, path, images=None):
         rect(s, W - Inches(3.2), Inches(-1.2), Inches(4.2), Inches(4.2), accent, MSO_SHAPE.OVAL)
         rect(s, W - Inches(2.2), Inches(5.3), Inches(3.0), Inches(3.0), accent, MSO_SHAPE.OVAL)
         rect(s, Inches(1.2), Inches(4.4), Inches(2.2), Inches(0.08), accent)
-        text(s, Inches(1.2), Inches(1.7), Inches(9.0), Inches(2.6), data.get("title", ""),
-             46, on_dark, True, anchor=MSO_ANCHOR.BOTTOM)
-        text(s, Inches(1.2), Inches(4.65), Inches(9.0), Inches(1.2), data.get("subtitle", ""),
-             22, "D1D5DB")
+        text(s, Inches(1.2), Inches(1.7), Inches(9.0), Inches(2.6), title_t, 46, on_dark, True,
+             anchor=MSO_ANCHOR.BOTTOM)
+        text(s, Inches(1.2), Inches(4.65), Inches(9.0), Inches(1.2), sub_t, 22, soft)
     elif style == "side":
         set_bg(s, dark)
         rect(s, 0, 0, Inches(4.5), H, accent)
         rect(s, Inches(-1.0), Inches(4.5), Inches(3.5), Inches(3.5), dark, MSO_SHAPE.OVAL)
         rect(s, Inches(5.2), Inches(4.1), Inches(2.2), Inches(0.08), accent)
-        text(s, Inches(5.2), Inches(1.4), Inches(7.4), Inches(2.6), data.get("title", ""),
-             42, on_dark, True, anchor=MSO_ANCHOR.BOTTOM)
-        text(s, Inches(5.2), Inches(4.4), Inches(7.4), Inches(1.5), data.get("subtitle", ""),
-             22, "D1D5DB")
-    else:  # minimal
+        text(s, Inches(5.2), Inches(1.4), Inches(7.4), Inches(2.6), title_t, 42, on_dark, True,
+             anchor=MSO_ANCHOR.BOTTOM)
+        text(s, Inches(5.2), Inches(4.4), Inches(7.4), Inches(1.5), sub_t, 22, soft)
+    elif style == "minimal":
         set_bg(s, light)
         rect(s, Inches(1.2), Inches(1.3), Inches(1.4), Inches(0.12), accent)
-        text(s, Inches(1.2), Inches(1.7), Inches(10.8), Inches(2.8), data.get("title", ""),
-             50, dark, True, anchor=MSO_ANCHOR.MIDDLE)
-        text(s, Inches(1.2), Inches(4.7), Inches(10.8), Inches(1.2), data.get("subtitle", ""),
-             22, txt)
+        text(s, Inches(1.2), Inches(1.7), Inches(10.8), Inches(2.8), title_t, 50, head_c, True,
+             anchor=MSO_ANCHOR.MIDDLE)
+        text(s, Inches(1.2), Inches(4.7), Inches(10.8), Inches(1.2), sub_t, 22, txt)
         rect(s, 0, H - Inches(0.5), W, Inches(0.5), dark)
+    elif style == "cards":
+        set_bg(s, light)
+        rect(s, Inches(1.0), Inches(1.0), W - Inches(2.0), Inches(5.3), card)
+        rect(s, Inches(1.0), Inches(1.0), Inches(0.2), Inches(5.3), accent)
+        text(s, Inches(1.7), Inches(1.3), Inches(9.9), Inches(2.7), title_t, 44, head_c, True,
+             anchor=MSO_ANCHOR.BOTTOM)
+        rect(s, Inches(1.7), Inches(4.25), Inches(2.0), Inches(0.08), accent)
+        text(s, Inches(1.7), Inches(4.5), Inches(9.9), Inches(1.4), sub_t, 22, txt)
+        rect(s, 0, H - Inches(0.5), W, Inches(0.5), dark)
+    elif style == "split":
+        set_bg(s, dark)
+        rect(s, W - Inches(5.3), 0, Inches(5.3), H, accent)
+        rect(s, W - Inches(3.8), Inches(1.2), Inches(3.0), Inches(3.0), dark, MSO_SHAPE.OVAL)
+        rect(s, W - Inches(2.8), Inches(4.6), Inches(1.6), Inches(1.6),
+             mix(accent, "FFFFFF", 0.5), MSO_SHAPE.OVAL)
+        rect(s, Inches(0.9), Inches(4.5), Inches(2.2), Inches(0.08), accent)
+        text(s, Inches(0.9), Inches(1.5), Inches(6.8), Inches(2.7), title_t, 42, on_dark, True,
+             anchor=MSO_ANCHOR.BOTTOM)
+        text(s, Inches(0.9), Inches(4.75), Inches(6.8), Inches(1.5), sub_t, 22, soft)
+    elif style == "bignum":
+        set_bg(s, light)
+        rect(s, W - Inches(5.2), Inches(0.8), Inches(6.4), Inches(6.4), accent, MSO_SHAPE.OVAL)
+        rect(s, W - Inches(4.0), Inches(2.0), Inches(4.0), Inches(4.0),
+             mix(accent, light, 0.55), MSO_SHAPE.OVAL)
+        rect(s, W - Inches(2.9), Inches(3.1), Inches(1.8), Inches(1.8), dark, MSO_SHAPE.OVAL)
+        rect(s, Inches(1.0), Inches(4.7), Inches(2.2), Inches(0.1), accent)
+        text(s, Inches(1.0), Inches(1.7), Inches(7.2), Inches(2.8), title_t, 50, head_c, True,
+             anchor=MSO_ANCHOR.BOTTOM)
+        text(s, Inches(1.0), Inches(4.95), Inches(7.2), Inches(1.4), sub_t, 22, txt)
+    elif style == "timeline":
+        set_bg(s, light)
+        rect(s, Inches(1.4), Inches(0.8), Inches(0.06), H - Inches(1.6), accent)
+        badge(s, Inches(1.28), Inches(0.65), Inches(0.3), "", accent)
+        badge(s, Inches(1.28), Inches(5.5), Inches(0.3), "", accent)
+        badge(s, Inches(1.08), Inches(2.95), Inches(0.7), "", dark)
+        text(s, Inches(2.4), Inches(1.5), Inches(9.5), Inches(2.8), title_t, 44, head_c, True,
+             anchor=MSO_ANCHOR.BOTTOM)
+        rect(s, Inches(2.4), Inches(4.5), Inches(2.0), Inches(0.08), accent)
+        text(s, Inches(2.4), Inches(4.75), Inches(9.5), Inches(1.4), sub_t, 22, txt)
+    elif style == "gradient":
+        set_grad(s, g_bottom, g_top)
+        rect(s, W - Inches(4.0), Inches(3.8), Inches(6.0), Inches(6.0),
+             mix(dark, accent, 0.3), MSO_SHAPE.OVAL)
+        rect(s, 0, 0, W, Inches(0.25), accent)
+        rect(s, Inches(1.2), Inches(4.4), Inches(2.2), Inches(0.08), accent)
+        text(s, Inches(1.2), Inches(1.7), Inches(10.0), Inches(2.6), title_t, 48, on_dark, True,
+             anchor=MSO_ANCHOR.BOTTOM)
+        text(s, Inches(1.2), Inches(4.65), Inches(10.0), Inches(1.3), sub_t, 22, soft)
+    else:  # magazine
+        set_bg(s, "FFFFFF")
+        rect(s, Inches(0.8), Inches(4.7), Inches(11.7), Inches(0.05), "111111")
+        rect(s, Inches(0.8), Inches(4.65), Inches(2.2), Inches(0.15), accent)
+        text(s, Inches(0.8), Inches(0.8), Inches(11.7), Inches(3.7), title_t, 58, "111111", True,
+             anchor=MSO_ANCHOR.BOTTOM)
+        text(s, Inches(0.8), Inches(5.0), Inches(11.7), Inches(1.3), sub_t, 24, "4B5563")
+        rect(s, 0, H - Inches(0.35), W, Inches(0.35), "111111")
 
-    # --- Asosiy slaydlar ---
+    # --------------------------- ASOSIY SLAYDLAR ---------------------------
     for i, sl in enumerate(slides, start=2):
         s = prs.slides.add_slide(blank)
-        set_bg(s, light)
         title = sl.get("title", "")
-        if style == "classic":
-            rect(s, 0, 0, W, Inches(1.35), dark)
-            rect(s, 0, Inches(1.35), W, Inches(0.07), accent)
-            badge = rect(s, Inches(0.55), Inches(0.35), Inches(0.65), Inches(0.65), accent,
-                         MSO_SHAPE.OVAL)
-            tf = badge.text_frame
-            tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-            p = tf.paragraphs[0]
-            p.alignment = PP_ALIGN.CENTER
-            r = p.add_run()
-            r.text = str(i - 1)
-            r.font.size, r.font.bold = Pt(18), True
-            r.font.color.rgb = rgb("FFFFFF")
-            text(s, Inches(1.45), Inches(0.1), Inches(11.4), Inches(1.15), title, 30,
-                 on_dark, True, anchor=MSO_ANCHOR.MIDDLE)
-            dot_x, text_x, full_w, top = 0.8, 1.2, 11.5, 1.85
-        elif style == "side":
-            rect(s, 0, 0, Inches(3.1), H, dark)
-            rect(s, Inches(3.1), 0, Inches(0.07), H, accent)
-            text(s, Inches(0.35), Inches(0.5), Inches(2.5), Inches(1.2), str(i - 1), 60,
-                 accent, True)
-            text(s, Inches(0.35), Inches(1.9), Inches(2.5), Inches(4.5), title, 26,
-                 on_dark, True)
-            dot_x, text_x, full_w, top = 3.6, 4.0, 9.0, 1.0
-        else:  # minimal
-            text(s, Inches(0.8), Inches(0.3), Inches(1.5), Inches(0.6), f"{i - 1:02d}", 22,
-                 accent, True)
-            text(s, Inches(0.8), Inches(0.8), Inches(11.7), Inches(1.0), title, 32,
-                 dark, True, anchor=MSO_ANCHOR.MIDDLE)
-            rect(s, Inches(0.8), Inches(1.85), Inches(1.2), Inches(0.07), accent)
-            dot_x, text_x, full_w, top = 0.8, 1.2, 11.5, 2.2
-
+        num = i - 1
         img = images[i - 2] if images and images[i - 2] else None
-        if img:
-            rect(s, Inches(8.4), Inches(1.8), Inches(IMG_W + 0.2), Inches(IMG_H + 0.2), accent)
-            s.shapes.add_picture(io.BytesIO(img), Inches(8.5), Inches(1.9),
-                                 Inches(IMG_W), Inches(IMG_H))
-            text_w = Inches(8.1 - text_x)
-        else:
-            text_w = Inches(full_w if style != "side" else 8.9)
-
         bullets = [b for b in sl.get("bullets", []) if b][:6] or [""]
         n = len(bullets)
-        chars = sum(len(b) for b in bullets)
-        size = 22 if chars < 260 else 20 if chars < 340 else 18
-        if img:
-            size -= 2
-        top_i, avail = Inches(top), Inches(6.7 - top)
-        step = int(avail / n)
-        for j, b in enumerate(bullets):
-            y = top_i + step * j
-            rect(s, Inches(dot_x), y + Inches(0.13), Inches(0.2), Inches(0.2), accent,
-                 MSO_SHAPE.OVAL)
-            text(s, Inches(text_x), y, text_w, step, b, size, txt)
+        start = 20 if img else 22
+        body = txt
+        ix, iy, iw, ih, frame = 8.4, 1.8, IMG_W, IMG_H, True   # rasm joyi
+        pn_x, pn_align = 11.6, PP_ALIGN.RIGHT                  # sahifa raqami joyi
 
-        text(s, Inches(11.6), Inches(6.95), Inches(1.4), Inches(0.4), f"{i} / {total}", 12,
-             "9CA3AF", align=PP_ALIGN.RIGHT)
+        if style == "classic":
+            set_bg(s, light)
+            rect(s, 0, 0, W, Inches(1.35), dark)
+            rect(s, 0, Inches(1.35), W, Inches(0.07), accent)
+            badge(s, Inches(0.55), Inches(0.35), Inches(0.65), num, accent, 18)
+            text(s, Inches(1.45), Inches(0.1), Inches(11.4), Inches(1.15), title, 30, on_dark,
+                 True, anchor=MSO_ANCHOR.MIDDLE)
+            kind = "plain"
+            P = dict(dot_x=0.8, text_x=1.2, text_w=6.9 if img else 11.5, top=1.85, bottom=6.7)
+
+        elif style == "side":
+            set_bg(s, light)
+            rect(s, 0, 0, Inches(3.1), H, dark)
+            rect(s, Inches(3.1), 0, Inches(0.07), H, accent)
+            text(s, Inches(0.35), Inches(0.5), Inches(2.5), Inches(1.2), str(num), 60, accent, True)
+            text(s, Inches(0.35), Inches(1.9), Inches(2.5), Inches(4.5), title, 26, on_dark, True)
+            kind = "plain"
+            P = dict(dot_x=3.6, text_x=4.0, text_w=4.1 if img else 8.9, top=1.0, bottom=6.7)
+
+        elif style == "minimal":
+            set_bg(s, light)
+            text(s, Inches(0.8), Inches(0.3), Inches(1.5), Inches(0.6), f"{num:02d}", 22, accent, True)
+            text(s, Inches(0.8), Inches(0.8), Inches(11.7), Inches(1.0), title, 32, head_c, True,
+                 anchor=MSO_ANCHOR.MIDDLE)
+            rect(s, Inches(0.8), Inches(1.85), Inches(1.2), Inches(0.07), accent)
+            kind = "plain"
+            P = dict(dot_x=0.8, text_x=1.2, text_w=6.9 if img else 11.5, top=2.2, bottom=6.7)
+            iy = 1.95
+
+        elif style == "cards":
+            set_bg(s, light)
+            badge(s, Inches(0.8), Inches(0.45), Inches(0.7), num, accent, 20)
+            text(s, Inches(1.75), Inches(0.3), Inches(11.0), Inches(1.0), title, 30, head_c, True,
+                 anchor=MSO_ANCHOR.MIDDLE)
+            rect(s, Inches(0.8), Inches(1.45), Inches(1.2), Inches(0.07), accent)
+            kind = "cards"
+            P = dict(x=0.8, w=7.3 if img else 11.7, top=1.85, bottom=6.7,
+                     cols=1 if (img or n <= 2) else 2)
+
+        elif style == "split":
+            set_bg(s, light)
+            rect(s, 0, 0, Inches(5.3), H, dark)
+            rect(s, Inches(5.3), 0, Inches(0.07), H, accent)
+            if img:
+                badge(s, Inches(0.5), Inches(0.45), Inches(0.65), num, accent, 18)
+                text(s, Inches(1.35), Inches(0.3), Inches(3.8), Inches(1.6), title, 24, on_dark,
+                     True, anchor=MSO_ANCHOR.MIDDLE)
+                ix, iy = 0.45, 2.1
+            else:
+                text(s, Inches(0.5), Inches(0.8), Inches(4.3), Inches(2.2), f"{num:02d}", 100,
+                     accent, True, anchor=MSO_ANCHOR.MIDDLE)
+                rect(s, Inches(0.55), Inches(3.2), Inches(1.6), Inches(0.08), accent)
+                text(s, Inches(0.5), Inches(3.45), Inches(4.4), Inches(3.2), title, 28, on_dark, True)
+            kind = "plain"
+            P = dict(dot_x=5.9, text_x=6.3, text_w=6.5, top=1.0, bottom=6.7)
+            start = min(start, 20)
+
+        elif style == "bignum":
+            set_bg(s, light)
+            text(s, Inches(0.7), Inches(0.3), Inches(3.6), Inches(2.3), f"{num:02d}", 110, accent,
+                 True, anchor=MSO_ANCHOR.MIDDLE)
+            text(s, Inches(4.3), Inches(0.5), Inches(4.0 if img else 8.4), Inches(2.0), title,
+                 26 if img else 34, head_c, True, anchor=MSO_ANCHOR.MIDDLE)
+            rect(s, Inches(0.8), Inches(2.75), Inches(7.3 if img else 11.7), Inches(0.04), accent)
+            kind = "plain"
+            P = dict(dot_x=0.9, text_x=1.3, text_w=6.8 if img else 11.4, top=3.1, bottom=6.7)
+
+        elif style == "timeline":
+            set_bg(s, light)
+            text(s, Inches(0.8), Inches(0.3), Inches(10.4), Inches(1.1), title, 30, head_c, True,
+                 anchor=MSO_ANCHOR.MIDDLE)
+            text(s, Inches(11.3), Inches(0.3), Inches(1.7), Inches(1.1), f"{num:02d}", 36, accent,
+                 True, PP_ALIGN.RIGHT, MSO_ANCHOR.MIDDLE)
+            rect(s, Inches(0.8), Inches(1.45), Inches(1.2), Inches(0.07), accent)
+            kind = "timeline"
+            P = dict(line_x=1.4, text_x=2.1, text_w=6.0 if img else 10.6, top=2.0, bottom=6.7)
+
+        elif style == "gradient":
+            set_grad(s, g_bottom, g_top)
+            rect(s, W - Inches(3.0), Inches(5.2), Inches(4.0), Inches(4.0),
+                 mix(dark, accent, 0.3), MSO_SHAPE.OVAL)
+            rect(s, 0, 0, W, Inches(0.25), accent)
+            badge(s, Inches(0.7), Inches(0.55), Inches(0.75), num, accent, 20)
+            text(s, Inches(1.7), Inches(0.4), Inches(11.0), Inches(1.1), title, 30, on_dark, True,
+                 anchor=MSO_ANCHOR.MIDDLE)
+            kind = "plain"
+            body = g_txt
+            P = dict(dot_x=0.8, text_x=1.2, text_w=6.9 if img else 11.5, top=1.9, bottom=6.7)
+
+        else:  # magazine
+            set_bg(s, "FFFFFF")
+            text(s, Inches(0.8), Inches(0.4), Inches(11.7), Inches(1.9), title, 40, "111111", True,
+                 anchor=MSO_ANCHOR.BOTTOM)
+            rect(s, Inches(0.8), Inches(2.45), Inches(11.7), Inches(0.04), "111111")
+            rect(s, Inches(0.8), Inches(2.4), Inches(1.6), Inches(0.14), accent)
+            kind = "numbered"
+            body = "1F2937"
+            P = dict(x=0.8, text_x=1.7, text_w=6.6 if img else 10.8, top=2.85, bottom=6.8)
+            ix, iy, iw, frame = 8.9, 2.75, 3.9, False
+            ih = iw * IMG_H / IMG_W
+            pn_x, pn_align = 0.8, PP_ALIGN.LEFT
+
+        if img:
+            put_image(s, img, ix, iy, iw, ih, frame, accent)
+
+        common = dict(start=start, color=body, accent=accent)
+        if kind == "plain":
+            bullets_plain(s, bullets, **P, **common)
+        elif kind == "cards":
+            bullets_cards(s, bullets, card=card, **P, **common)
+        elif kind == "timeline":
+            bullets_timeline(s, bullets, **P, **common)
+        else:
+            bullets_numbered(s, bullets, **P, **common)
+
+        text(s, Inches(pn_x), Inches(6.95), Inches(1.4), Inches(0.4), f"{i} / {total}", 12,
+             "9CA3AF", align=pn_align)
         if sl.get("notes"):
             s.notes_slide.notes_text_frame.text = sl["notes"]
 
-    # --- Yakuniy ---
+    # ------------------------------ YAKUNIY ------------------------------
     s = prs.slides.add_slide(blank)
-    set_bg(s, dark)
-    if style == "side":
-        rect(s, 0, 0, Inches(0.35), H, accent)
-    else:
-        rect(s, W - Inches(0.35), 0, Inches(0.35), H, accent)
-    rect(s, Inches(-1.5), Inches(4.8), Inches(4.0), Inches(4.0), accent, MSO_SHAPE.OVAL)
     t1, t2 = THANKS[lang]
-    text(s, 0, Inches(2.5), W, Inches(1.6), t1, 44, on_dark, True, PP_ALIGN.CENTER,
-         MSO_ANCHOR.MIDDLE)
-    text(s, 0, Inches(4.2), W, Inches(0.8), t2, 22, "D1D5DB", align=PP_ALIGN.CENTER)
+    if style in ("classic", "side", "split"):
+        set_bg(s, dark)
+        if style == "side":
+            rect(s, 0, 0, Inches(0.35), H, accent)
+        else:
+            rect(s, W - Inches(0.35), 0, Inches(0.35), H, accent)
+        rect(s, Inches(-1.5), Inches(4.8), Inches(4.0), Inches(4.0), accent, MSO_SHAPE.OVAL)
+        c1, c2 = on_dark, soft
+    elif style == "gradient":
+        set_grad(s, g_bottom, g_top)
+        rect(s, 0, 0, W, Inches(0.25), accent)
+        rect(s, Inches(-1.5), Inches(4.8), Inches(4.0), Inches(4.0),
+             mix(dark, accent, 0.3), MSO_SHAPE.OVAL)
+        c1, c2 = on_dark, soft
+    elif style == "magazine":
+        set_bg(s, "FFFFFF")
+        rect(s, (W - Inches(2.2)) // 2, Inches(4.1), Inches(2.2), Inches(0.1), accent)
+        rect(s, 0, H - Inches(0.35), W, Inches(0.35), "111111")
+        c1, c2 = "111111", "4B5563"
+    else:  # minimal, cards, bignum, timeline
+        set_bg(s, light)
+        rect(s, (W - Inches(2.2)) // 2, Inches(4.1), Inches(2.2), Inches(0.08), accent)
+        rect(s, 0, H - Inches(0.5), W, Inches(0.5), dark)
+        c1, c2 = head_c, txt
+    text(s, 0, Inches(2.5), W, Inches(1.6), t1, 44, c1, True, PP_ALIGN.CENTER, MSO_ANCHOR.MIDDLE)
+    text(s, 0, Inches(4.3), W, Inches(0.8), t2, 22, c2, align=PP_ALIGN.CENTER)
 
     prs.save(path)
 
@@ -621,13 +935,19 @@ async def cmd_cancel(m: Message, state: FSMContext):
     await m.answer("❌ Bekor qilindi. Yangi taqdimot uchun /new ni bosing.", reply_markup=main_kb())
 
 
+@router.message(Command("skip"))
+async def cmd_skip(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("👍 Yaxshi. Yangi taqdimot uchun /new ni bosing.", reply_markup=main_kb())
+
+
 @router.message(Command("help"))
 async def cmd_help(m: Message):
     await m.answer(
         "ℹ️ <b>Qanday ishlaydi?</b>\n"
         "1️⃣ Mavzuni yozasiz\n2️⃣ Slayd sonini tanlaysiz\n3️⃣ Tilni tanlaysiz\n"
-        "4️⃣ Dizaynni tanlaysiz\n5️⃣ Rasm kerakmi — tanlaysiz\n"
-        "6️⃣ Tayyor .pptx faylni olasiz\n\n"
+        "4️⃣ Rangni tanlaysiz\n5️⃣ Maketni tanlaysiz\n6️⃣ Rasm kerakmi — tanlaysiz\n"
+        "7️⃣ Tayyor .pptx faylni olasiz\n\n"
         "/new — yangi taqdimot\n/cancel — bekor qilish",
         parse_mode="HTML",
     )
@@ -699,7 +1019,7 @@ async def got_lang(c: CallbackQuery, state: FSMContext):
         return
     lang = c.data.split(":")[1]
     await state.update_data(lang=lang)
-    await c.message.edit_text(f"🌐 Til: <b>{LANGS[lang][0]}</b>\n\n🎨 Dizaynni tanlang:",
+    await c.message.edit_text(f"🌐 Til: <b>{LANGS[lang][0]}</b>\n\n🎨 Rangni tanlang:",
                               parse_mode="HTML", reply_markup=theme_kb())
     await c.answer()
 
@@ -712,7 +1032,23 @@ async def got_theme(c: CallbackQuery, state: FSMContext):
     theme = c.data.split(":")[1]
     await state.update_data(theme=theme)
     await c.message.edit_text(
-        f"🎨 Dizayn: <b>{THEMES[theme][0]}</b>\n\n🖼 Slaydlarga rasm qo'shilsinmi?",
+        f"🎨 Rang: <b>{THEMES[theme][0]}</b>\n\n📐 Slayd maketini tanlang:",
+        parse_mode="HTML", reply_markup=style_kb())
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("style:"))
+async def got_style(c: CallbackQuery, state: FSMContext):
+    if "theme" not in await state.get_data():
+        await c.answer("Avval /new ni bosing", show_alert=True)
+        return
+    style = c.data.split(":")[1]
+    if style not in STYLES:
+        await c.answer("Noma'lum maket", show_alert=True)
+        return
+    await state.update_data(style=style)
+    await c.message.edit_text(
+        f"📐 Maket: <b>{STYLES[style]}</b>\n\n🖼 Slaydlarga rasm qo'shilsinmi?",
         parse_mode="HTML", reply_markup=images_kb())
     await c.answer()
 
@@ -721,7 +1057,7 @@ async def got_theme(c: CallbackQuery, state: FSMContext):
 async def got_images(c: CallbackQuery, state: FSMContext):
     uid = c.from_user.id
     d = await state.get_data()
-    if not all(k in d for k in ("topic", "count", "lang", "theme")):
+    if not all(k in d for k in ("topic", "count", "lang", "theme", "style")):
         await c.answer("Avval /new ni bosing", show_alert=True)
         return
     if uid in busy_users:
@@ -735,7 +1071,9 @@ async def got_images(c: CallbackQuery, state: FSMContext):
         return
 
     want_images = c.data.endswith("yes")
-    topic, count, lang, theme = d["topic"], d["count"], d["lang"], d["theme"]
+    topic, count, lang, theme, style = d["topic"], d["count"], d["lang"], d["theme"], d["style"]
+    if style == "random":
+        style = random.choice(STYLE_KEYS)
     busy_users.add(uid)
     await c.answer()
     status = await c.message.edit_text(
@@ -755,10 +1093,12 @@ async def got_images(c: CallbackQuery, state: FSMContext):
         await status.edit_text("🛠 Fayl yig'ilmoqda...")
         fd, path = tempfile.mkstemp(suffix=".pptx")
         os.close(fd)
-        await asyncio.to_thread(build_pptx, content, theme, lang, path, images)
+        await asyncio.to_thread(build_pptx, content, theme, style, lang, path, images)
 
         safe = re.sub(r"[^\w\-]+", "_", topic)[:40] or "taqdimot"
-        extra = f"\n🖼 Rasmlar: {found} ta" if want_images else ""
+        extra = f"\n🎨 {THEMES[theme][0]} · {STYLES[style]}"
+        if want_images:
+            extra += f"\n🖼 Rasmlar: {found} ta"
         if uid != ADMIN_ID:
             extra += f"\n💎 Qolgan limit: {max(get_credits(uid) - 1, 0)} ta"
         await c.message.answer_document(
@@ -769,6 +1109,16 @@ async def got_images(c: CallbackQuery, state: FSMContext):
             reply_markup=main_kb(),
         )
         consume(uid)  # limit faqat muvaffaqiyatli yuborilgandan keyin kamayadi
+
+        # Har 10 ta taqdimotdan ~3 tasidan keyin fikr so'raymiz
+        if random.random() < FEEDBACK_RATE:
+            try:
+                fid = new_feedback(uid, c.from_user.full_name, topic, theme, style)
+                await c.message.answer(
+                    "💬 Slaydlar dizayni sizga qanday ko'rinsa, baholang:",
+                    reply_markup=feedback_kb(fid))
+            except Exception as e:
+                log.warning("Fikr so'rovi yuborilmadi: %s", e)
         await status.delete()
     except Exception as e:
         log.exception("Generatsiya xatosi")
@@ -781,6 +1131,57 @@ async def got_images(c: CallbackQuery, state: FSMContext):
         await state.clear()
         if path and os.path.exists(path):
             os.remove(path)
+
+
+# ================================== FIKR (baho) ==================================
+def feedback_text(row, comment=None) -> str:
+    theme_name = THEMES.get(row["theme"], ("?",))[0]
+    style_name = STYLES.get(row["style"], row["style"])
+    t = (f"💬 <b>Fikr #{row['id']}</b>\n"
+         f"👤 {html.escape(row['name'] or '')} (id {row['user_id']})\n"
+         f"⭐️ Baho: {row['score']}/5\n"
+         f"🎯 Mavzu: {html.escape(row['topic'] or '')}\n"
+         f"🎨 {theme_name} · {style_name}")
+    if comment:
+        t += f"\n\n✍️ {html.escape(comment)}"
+    return t
+
+
+async def tell_admin(bot: Bot, msg: str):
+    if not ADMIN_ID:
+        return
+    try:
+        await bot.send_message(ADMIN_ID, msg, parse_mode="HTML")
+    except Exception as e:
+        log.warning("Adminga xabar ketmadi: %s", e)
+
+
+@router.callback_query(F.data.startswith("fb:"))
+async def got_rating(c: CallbackQuery, state: FSMContext):
+    _, score, fid = c.data.split(":")
+    row = set_score(int(fid), c.from_user.id, int(score))
+    if not row:
+        await c.answer("Bu baho allaqachon qabul qilingan", show_alert=True)
+        return
+    await state.set_state(Form.comment)
+    await state.update_data(fb=int(fid))
+    await c.message.edit_text(
+        f"🙏 Rahmat! Bahoyingiz: {'⭐️' * int(score)}\n\n"
+        "✍️ Xohlasangiz, fikringizni yozing (nima yoqdi, nima yoqmadi).\n"
+        "Yozmasangiz — /skip ni bosing.")
+    await c.answer()
+    await tell_admin(c.bot, feedback_text(row))
+
+
+@router.message(Form.comment, F.text, ~F.text.startswith("/"))
+async def got_comment(m: Message, state: FSMContext):
+    fid = (await state.get_data()).get("fb")
+    await state.clear()
+    if fid:
+        row = set_comment(fid, m.from_user.id, m.text[:1000])
+        if row:
+            await tell_admin(m.bot, feedback_text(row, comment=m.text[:1000]))
+    await m.answer("✅ Fikringiz uchun rahmat! Yangi taqdimot: /new", reply_markup=main_kb())
 
 
 # ================================= TO'LOVLAR =================================
@@ -945,10 +1346,17 @@ async def cmd_stats(m: Message):
         card = c.execute("SELECT COUNT(*), COALESCE(SUM(amount),0) FROM payments "
                          "WHERE kind='card' AND status='approved'").fetchone()
         pend = c.execute("SELECT COUNT(*) FROM payments WHERE status='pending'").fetchone()[0]
+        fb = c.execute("SELECT COUNT(score), COALESCE(AVG(score),0) FROM feedback "
+                       "WHERE score IS NOT NULL").fetchone()
+        by_style = c.execute("SELECT style, COUNT(score) n, AVG(score) a FROM feedback "
+                             "WHERE score IS NOT NULL GROUP BY style ORDER BY a DESC").fetchall()
+    lines = [f"  {STYLES.get(r['style'], r['style'])}: {r['a']:.1f} ⭐️ ({r['n']} ta)" for r in by_style]
     await m.answer(
         f"📈 <b>Statistika</b>\n👥 Foydalanuvchilar: {users}\n📊 Yaratilgan taqdimotlar: {made}\n"
         f"⭐️ Stars: {stars[0]} ta, jami {stars[1]} ⭐️\n"
-        f"💳 Karta: {card[0]} ta, jami {som(card[1])} so'm\n⏳ Kutilayotgan: {pend}",
+        f"💳 Karta: {card[0]} ta, jami {som(card[1])} so'm\n⏳ Kutilayotgan: {pend}\n\n"
+        f"💬 Baholar: {fb[0]} ta, o'rtacha {fb[1]:.1f}/5"
+        + ("\n🎨 Maketlar bo'yicha:\n" + "\n".join(lines) if lines else ""),
         parse_mode="HTML")
 
 
