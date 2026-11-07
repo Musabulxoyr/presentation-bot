@@ -247,6 +247,7 @@ def init_db():
         add_column(c, "users", "logo BLOB")
         add_column(c, "users", "balance INTEGER NOT NULL DEFAULT 0")
         add_column(c, "users", "bonus_day TEXT")
+        add_column(c, "users", "last_seen INTEGER")
 
 
 def meta_get(key: str, default: str = ""):
@@ -365,6 +366,16 @@ def claim_daily(uid: int) -> bool:
                         (BONUS_SOM, day, uid, day))
         c.commit()
         return cur.rowcount == 1
+
+
+def touch_user(uid: int):
+    """Foydalanuvchining oxirgi faolligini yozib qo'yadi (statistika uchun)."""
+    try:
+        with closing(db()) as c:
+            c.execute("UPDATE users SET last_seen=? WHERE user_id=?", (int(time.time()), uid))
+            c.commit()
+    except Exception:
+        pass
 
 
 def bonus_wait_text() -> str:
@@ -612,6 +623,7 @@ class AntiSpam(BaseMiddleware):
     def __init__(self):
         self.hits: dict[int, list] = {}
         self.until: dict[int, float] = {}
+        self.seen: dict[int, float] = {}
 
     def _prune(self, now: float):
         for uid in list(self.hits):
@@ -652,6 +664,9 @@ class AntiSpam(BaseMiddleware):
             return None
         if len(self.hits) > 5000:
             self._prune(now)
+        if now - self.seen.get(user.id, 0) > 60:  # faollikni daqiqada bir marta yozamiz
+            self.seen[user.id] = now
+            touch_user(user.id)
         return await handler(event, data)
 
 
@@ -2179,6 +2194,10 @@ async def cmd_stats(m: Message):
         by_style = c.execute("SELECT style, COUNT(score) n, AVG(score) a FROM feedback "
                              "WHERE score IS NOT NULL GROUP BY style ORDER BY a DESC").fetchall()
         bonus_today = c.execute("SELECT COUNT(*) FROM users WHERE bonus_day=?", (today_key(),)).fetchone()[0]
+        never = c.execute("SELECT COUNT(*) FROM users WHERE made=0").fetchone()[0]
+        act1 = c.execute("SELECT COUNT(*) FROM users WHERE last_seen>=?", (now - 86400,)).fetchone()[0]
+        act7 = c.execute("SELECT COUNT(*) FROM users WHERE last_seen>=?", (now - 7 * 86400,)).fetchone()[0]
+        act30 = c.execute("SELECT COUNT(*) FROM users WHERE last_seen>=?", (now - 30 * 86400,)).fetchone()[0]
     lines = [f"  {STYLES.get(r['style'], r['style'])}: {r['a']:.1f} ⭐️ ({r['n']} ta)" for r in by_style]
     try:
         last_bk = int(meta_get("last_backup", "0") or 0)
@@ -2190,6 +2209,9 @@ async def cmd_stats(m: Message):
         f"📊 Yaratilgan taqdimotlar: {made}\n✏️ Tahrirlar: {edits}\n"
         f"🎁 Referallar: {refs[0]} ta (bonus berilgan: {refs[1]})\n"
         f"🎉 Bugun kunlik bonus olganlar: {bonus_today}\n"
+        f"😴 Hali taqdimot yaratmaganlar: {never} ta\n"
+        f"🟢 Faol: 24 soatda {act1}, 7 kunda {act7}, 30 kunda {act30}\n"
+        f"💤 7 kundan beri kirmaganlar: {max(users - act7, 0)} ta\n"
         f"⭐️ Stars: {stars[0]} ta, jami {stars[1]} ⭐️\n"
         f"💳 Karta: {card[0]} ta, jami {som(card[1])} so'm\n⏳ Kutilayotgan: {pend}\n"
         f"💾 Oxirgi zaxira: {bk_txt}\n\n"
