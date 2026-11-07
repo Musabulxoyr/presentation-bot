@@ -65,7 +65,8 @@ DB_PATH = os.getenv("DB_PATH") or "bot.db"        # Railway'da Volume ulasangiz:
 
 FREE_LIMIT = 3          # har bir yangi foydalanuvchiga bepul taqdimotlar soni
 FEEDBACK_RATE = 0.3     # har 10 ta taqdimotdan ~3 tasidan keyin fikr so'raladi (sinash uchun 1.0 qiling)
-REF_BONUS = 1           # do'st birinchi taqdimotini yaratganda taklif qilganga beriladigan limit
+REF_BONUS_SOM = 1000    # do'st birinchi taqdimotini yaratganda taklif qilganga balansiga tushadigan summa (so'm)
+                        # bu pul faqat bot ichida ishlatiladi, yechib bo'lmaydi
 REF_MAX = 20            # bitta foydalanuvchi maksimal nechta do'st uchun bonus oladi
 EDIT_LIMIT = 5          # bitta taqdimotni bepul tahrirlash soni
 KEEP_DECKS = 10         # /history da saqlanadigan taqdimotlar soni
@@ -199,7 +200,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users(
             user_id INTEGER PRIMARY KEY, name TEXT, credits INTEGER NOT NULL,
             made INTEGER NOT NULL DEFAULT 0, created INTEGER,
-            referrer INTEGER, ref_paid INTEGER NOT NULL DEFAULT 0, author TEXT, logo BLOB);
+            referrer INTEGER, ref_paid INTEGER NOT NULL DEFAULT 0, author TEXT, logo BLOB,
+            balance INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS payments(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, kind TEXT,
             amount INTEGER, status TEXT, receipt TEXT, ts INTEGER, credits INTEGER);
@@ -220,6 +222,7 @@ def init_db():
         add_column(c, "users", "ref_paid INTEGER NOT NULL DEFAULT 0")
         add_column(c, "users", "author TEXT")
         add_column(c, "users", "logo BLOB")
+        add_column(c, "users", "balance INTEGER NOT NULL DEFAULT 0")
 
 
 # ---------------- FSM holati SQLite'da (qayta ishga tushsa yo'qolmaydi) ----------------
@@ -287,6 +290,28 @@ def add_credits(uid: int, n: int):
         c.commit()
 
 
+def get_money(uid: int) -> int:
+    """Foydalanuvchining bot ichidagi so'm balansi (faqat bot ichida ishlatiladi)."""
+    ensure_user(uid)
+    with closing(db()) as c:
+        return c.execute("SELECT balance FROM users WHERE user_id=?", (uid,)).fetchone()[0] or 0
+
+
+def add_money(uid: int, n: int):
+    ensure_user(uid)
+    with closing(db()) as c:
+        c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (n, uid))
+        c.commit()
+
+
+def spend_money(uid: int, n: int) -> bool:
+    """Balansdan n so'm yechadi. Yetmasa hech narsa o'zgarmaydi va False qaytaradi."""
+    with closing(db()) as c:
+        cur = c.execute("UPDATE users SET balance=balance-? WHERE user_id=? AND balance>=?", (n, uid, n))
+        c.commit()
+        return cur.rowcount == 1
+
+
 def consume(uid: int):
     """Limitni kamaytiradi. Agar bu foydalanuvchining birinchi taqdimoti bo'lsa va uni
     kimdir taklif qilgan bo'lsa, taklif qilganga bonus beradi va uning ID sini qaytaradi."""
@@ -303,7 +328,7 @@ def consume(uid: int):
             c.execute("UPDATE users SET ref_paid=1 WHERE user_id=?", (uid,))
             c.commit()
         if paid < REF_MAX:
-            add_credits(ref, REF_BONUS)
+            add_money(ref, REF_BONUS_SOM)
             return ref
     return None
 
@@ -1772,7 +1797,7 @@ async def cmd_start(m: Message, state: FSMContext, command: CommandObject):
             ensure_user(uid, m.from_user.full_name)
             set_referrer(uid, ref)
             await m.answer("🎁 Do'stingiz taklifi bilan keldingiz! Birinchi taqdimotingiz tayyor bo'lgach, "
-                           "u ham sovg'a oladi.")
+                           "taklif qilgan do'stingiz bonus oladi.")
     ensure_user(uid, m.from_user.full_name)
     await ask_topic(m, state)
 
@@ -1816,8 +1841,10 @@ async def cmd_balance(m: Message):
     if is_admin(m.from_user.id):
         await m.answer("👑 Siz adminsiz: cheksiz.")
     else:
-        await m.answer(f"💎 Sizda <b>{n}</b> ta taqdimot qoldi.\n\n"
-                       "➕ Balansni to'ldirish uchun paketni tanlang:",
+        money = get_money(m.from_user.id)
+        await m.answer(f"💎 Sizda <b>{n}</b> ta taqdimot qoldi.\n"
+                       f"💰 Bonus balans: <b>{som(money)} so'm</b> (faqat botda ishlatiladi)\n\n"
+                       "➕ Paketni tanlang (balansdan ham to'lash mumkin):",
                        parse_mode="HTML", reply_markup=packs_kb())
 
 
@@ -1844,8 +1871,10 @@ async def cmd_invite(m: Message):
     await m.answer(
         "🎁 <b>Do'st taklif qiling — bepul taqdimot oling!</b>\n\n"
         f"Sizning havolangiz:\n{link}\n\n"
-        f"Do'stingiz birinchi taqdimotini yaratganda sizga <b>+{REF_BONUS}</b> ta taqdimot beriladi "
-        f"(maksimum {REF_MAX} ta do'st uchun).\n\n"
+        f"Do'stingiz birinchi taqdimotini yaratganda sizning balansingizga <b>{som(REF_BONUS_SOM)} so'm</b> "
+        f"tushadi (maksimum {REF_MAX} ta do'st uchun).\n"
+        "💰 Bu pulni yechib bo'lmaydi, faqat bot ichida taqdimot uchun to'lashda ishlatiladi.\n\n"
+        f"💰 Hozirgi balansingiz: {som(get_money(uid))} so'm\n"
         f"👥 Taklif qilinganlar: {a}\n🎉 Bonus olingan: {b}",
         parse_mode="HTML", disable_web_page_preview=True)
 
@@ -1957,7 +1986,7 @@ async def cmd_user(m: Message):
     a, b = ref_stats(uid)
     await m.answer(
         f"👤 {html.escape(r['name'] or '')} (id {uid})\n💎 Limit: {r['credits']}\n"
-        f"📊 Yaratgan: {r['made']}\n🗂 Tarixda: {nd}\n🎁 Taklif qilgan: {a} (bonus: {b})\n"
+        f"💰 Bonus balans: {som(r['balance'] or 0)} so'm\n📊 Yaratgan: {r['made']}\n🗂 Tarixda: {nd}\n🎁 Taklif qilgan: {a} (bonus: {b})\n"
         f"👥 Taklif qilgan odam: {r['referrer'] or '-'}\n✍️ Muallif: {html.escape(r['author'] or '-')}",
         parse_mode="HTML")
 
@@ -2217,7 +2246,8 @@ async def plan_ok(c: CallbackQuery, state: FSMContext):
             try:
                 await c.bot.send_message(
                     ref, f"🎁 Do'stingiz taklifingiz bilan birinchi taqdimotini yaratdi! "
-                         f"+{REF_BONUS} ta taqdimot sovg'a.\n💎 Jami: {get_credits(ref)} ta")
+                         f"Balansingizga +{som(REF_BONUS_SOM)} so'm tushdi.\n"
+                         f"💰 Balans: {som(get_money(ref))} so'm (bot ichida to'lashda ishlatiladi)")
             except Exception as e:
                 log.warning("Referalga xabar ketmadi: %s", e)
 
@@ -2685,6 +2715,9 @@ async def choose_pack(c: CallbackQuery):
     n, stars, s = PACKS[i]
     kb = InlineKeyboardBuilder()
     kb.button(text=f"⭐️ {stars} Stars bilan to'lash", callback_data=f"pay:stars:{i}")
+    money = get_money(c.from_user.id)
+    if money > 0:
+        kb.button(text=f"💰 Balansdan to'lash ({som(money)} / {som(s)} so'm)", callback_data=f"pay:bal:{i}")
     if card_on():
         kb.button(text=f"💳 {som(s)} so'm (karta)", callback_data=f"pay:card:{i}")
     kb.button(text="⬅️ Orqaga", callback_data="buy:menu")
@@ -2692,6 +2725,24 @@ async def choose_pack(c: CallbackQuery):
     await c.message.edit_text(f"📦 Paket: <b>{n} ta taqdimot</b>\n\nTo'lov usulini tanlang:",
                               parse_mode="HTML", reply_markup=kb.as_markup())
     await c.answer()
+
+
+@router.callback_query(F.data.startswith("pay:bal:"))
+async def pay_balance(c: CallbackQuery):
+    uid = c.from_user.id
+    i = int(c.data.split(":")[2])
+    n, _, s = PACKS[i]
+    if not spend_money(uid, s):
+        have = get_money(uid)
+        await c.answer(f"Balans yetarli emas: {som(have)} so'm bor, kerak {som(s)} so'm.", show_alert=True)
+        return
+    new_payment(uid, "balance", s, "paid", "", n)
+    add_credits(uid, n)
+    await c.answer()
+    await c.message.answer(
+        f"✅ Balansdan {som(s)} so'm yechildi. +{n} ta taqdimot.\n"
+        f"💎 Jami: {get_credits(uid)} ta\n💰 Qolgan balans: {som(get_money(uid))} so'm\n\n📊 Boshlash: /new",
+        reply_markup=main_kb())
 
 
 @router.callback_query(F.data.startswith("pay:stars:"))
