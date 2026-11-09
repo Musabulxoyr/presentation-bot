@@ -13,13 +13,14 @@ Imkoniyatlar:
   - Holat SQLite'da saqlanadi (bot qayta ishga tushsa yo'qolmaydi)
   - Bir nechta Gemini kalit (GEMINI_API_KEYS=kalit1,kalit2), generatsiya navbati
   - Yakuniy slayd matnini AI mavzuga qarab o'zi yozadi (closing_title / closing_sub)
-  - YANGI: slayd soni tugmalari + "Boshqa" (o'zi xohlagan sonni yozadi)
-  - YANGI: SPAM himoyasi (juda tez bosgan/yozganni vaqtincha to'xtatadi)
-  - YANGI: avtomatik ZAXIRA (bazani adminga yuboradi) + /backup
-  - YANGI: kunlik BONUS (150 so'm) + "Kunlik bonus" tugmasi va /bonus
-  - YANGI: karta to'lovida chek skrinshot YOKI PDF ko'rinishida qabul qilinadi
+  - Slayd soni tugmalari + "Boshqa" (o'zi xohlagan sonni yozadi)
+  - SPAM himoyasi (juda tez bosgan/yozganni vaqtincha to'xtatadi)
+  - Avtomatik ZAXIRA (bazani adminga yuboradi) + /backup
+  - Kunlik BONUS (150 so'm) + "Kunlik bonus" tugmasi va /bonus
+  - Karta to'lovida chek skrinshot YOKI PDF ko'rinishida qabul qilinadi
+  - YANGI: 📄 REFERAT rejimi (Word .docx): mavzu -> 5/10/15 bet -> til -> tayyor fayl (/referat)
 
-O'rnatish:  pip install -r requirements.txt
+O'rnatish:  pip install -r requirements.txt   (python-docx kerak)
 PDF uchun serverda LibreOffice kerak (nixpacks.toml ga qarang); bo'lmasa PDF tugmasi chiqmaydi.
 """
 import asyncio
@@ -50,6 +51,12 @@ from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, FSInput
                            KeyboardButton, LabeledPrice, Message, PreCheckoutQuery,
                            ReplyKeyboardMarkup)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Cm
+from docx.shared import Pt as DPt
 from PIL import Image, ImageDraw, ImageFont
 from pptx import Presentation
 from pptx.chart.data import CategoryChartData
@@ -186,6 +193,7 @@ class Form(StatesGroup):
     author = State()
     logo = State()
     broadcast = State()
+    ref_topic = State()   # YANGI: referat mavzusi
 
 
 # ================================ BAZA ================================
@@ -703,15 +711,16 @@ BTN_REF = "🎁 Do'st taklif"
 BTN_SET = "⚙️ Sozlamalar"
 BTN_HELP = "ℹ️ Yordam"
 BTN_BONUS = "🎉 Kunlik bonus"
+BTN_DOC = "📄 Referat"
 
 
 def main_kb():
     """Doimiy pastki menyu."""
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_HIST)],
-                  [KeyboardButton(text=BTN_BAL), KeyboardButton(text=BTN_BUY)],
-                  [KeyboardButton(text=BTN_REF), KeyboardButton(text=BTN_SET)],
-                  [KeyboardButton(text=BTN_HELP)],
+        keyboard=[[KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_DOC)],
+                  [KeyboardButton(text=BTN_HIST), KeyboardButton(text=BTN_BAL)],
+                  [KeyboardButton(text=BTN_BUY), KeyboardButton(text=BTN_REF)],
+                  [KeyboardButton(text=BTN_SET), KeyboardButton(text=BTN_HELP)],
                   [KeyboardButton(text=BTN_BONUS)]],
         resize_keyboard=True, is_persistent=True,
         input_field_placeholder="Mavzuni yozing, fayl yuboring yoki tugmani bosing")
@@ -2055,7 +2064,8 @@ async def ask_topic(m: Message, state: FSMContext):
         "👋 Salom! Men sizga professional taqdimot tayyorlab beraman.\n\n"
         "✍️ Taqdimot mavzusini yozing, masalan:\n"
         "• <i>Global isish</i>\n• <i>Sun'iy intellekt kelajagi</i>\n• <i>Amir Temur</i>\n\n"
-        "📄 Yoki <b>PDF / DOCX / TXT</b> fayl yuboring, men shu asosida taqdimot qilaman.",
+        "📄 Yoki <b>PDF / DOCX / TXT</b> fayl yuboring, men shu asosida taqdimot qilaman.\n"
+        "📝 Referat (Word) kerak bo'lsa: <b>📄 Referat</b> tugmasini bosing.",
         parse_mode="HTML", reply_markup=main_kb(),
     )
 
@@ -2106,7 +2116,8 @@ async def cmd_help(m: Message):
         "3️⃣ Rasm kerakmi — tanlaysiz\n"
         "4️⃣ Tayyor <b>rejani</b> ko'rib tasdiqlaysiz\n"
         "5️⃣ .pptx faylni olasiz, so'ng uni tahrirlash, dizaynini almashtirish yoki PDF qilish mumkin\n\n"
-        "/new — yangi taqdimot\n/history — oldingi taqdimotlar\n/balance — balans\n"
+        "📄 <b>Referat:</b> /referat — mavzu, hajm (5/10/15 bet) va tilni tanlaysiz, Word fayl olasiz\n\n"
+        "/new — yangi taqdimot\n/referat — referat (Word)\n/history — oldingi taqdimotlar\n/balance — balans\n"
         f"/bonus — kunlik bonus (+{som(BONUS_SOM)} so'm)\n"
         "/invite — do'st taklif qilib bonus olish\n/settings — muallif ismi va logo\n/cancel — bekor qilish",
         parse_mode="HTML",
@@ -2184,7 +2195,8 @@ async def show_settings(m: Message, uid: int):
         "⚙️ <b>Sozlamalar</b>\n\n"
         f"👤 Muallif: <b>{html.escape(author) if author else 'kiritilmagan'}</b>\n"
         f"🖼 Logo: <b>{'yuklangan' if logo else 'yo`q'}</b>\n\n"
-        "Muallif ismi va logo taqdimotning birinchi (titul) slaydida chiqadi.",
+        "Muallif ismi va logo taqdimotning birinchi (titul) slaydida chiqadi. "
+        "Muallif ismi referatning titul varag'ida ham chiqadi.",
         parse_mode="HTML", reply_markup=settings_kb(bool(author), bool(logo)))
 
 
@@ -2264,7 +2276,7 @@ async def cmd_stats(m: Message):
     bk_txt = (time.strftime("%d.%m %H:%M", time.gmtime(last_bk + TZ_OFFSET)) if last_bk else "hali yo'q")
     await m.answer(
         f"📈 <b>Statistika</b>\n👥 Foydalanuvchilar: {users} (24 soatda +{new24})\n"
-        f"📊 Yaratilgan taqdimotlar: {made}\n✏️ Tahrirlar: {edits}\n"
+        f"📊 Yaratilgan taqdimotlar (referatlar bilan): {made}\n✏️ Tahrirlar: {edits}\n"
         f"🎁 Referallar: {refs[0]} ta (bonus berilgan: {refs[1]})\n"
         f"🎉 Bugun kunlik bonus olganlar: {bonus_today}\n"
         f"😴 Hali taqdimot yaratmaganlar: {never} ta\n"
@@ -3278,6 +3290,259 @@ async def admin_decide(c: CallbackQuery):
     await c.answer("Bajarildi")
 
 
+# =====================================================================
+# 📄 REFERAT REJIMI (Word .docx)
+# =====================================================================
+DOC_PAGES = [5, 10, 15]
+
+DOC_LABELS = {
+    "uz": dict(ref="REFERAT", topic="Mavzu", plan="REJA", intro="Kirish", concl="Xulosa",
+               src="FOYDALANILGAN ADABIYOTLAR", by="Bajardi"),
+    "ru": dict(ref="РЕФЕРАТ", topic="Тема", plan="ПЛАН", intro="Введение", concl="Заключение",
+               src="СПИСОК ЛИТЕРАТУРЫ", by="Выполнил(а)"),
+    "en": dict(ref="ESSAY", topic="Topic", plan="CONTENTS", intro="Introduction", concl="Conclusion",
+               src="REFERENCES", by="Prepared by"),
+}
+
+
+def _dfont(run, size=14, bold=False):
+    run.font.name = "Times New Roman"
+    run._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), "Times New Roman")
+    run.font.size = DPt(size)
+    run.bold = bold
+
+
+def _dpara(doc, text, align=WD_ALIGN_PARAGRAPH.JUSTIFY, size=14, bold=False, indent=True, after=0):
+    p = doc.add_paragraph()
+    p.alignment = align
+    pf = p.paragraph_format
+    pf.line_spacing = 1.5
+    pf.space_after = DPt(after)
+    if indent:
+        pf.first_line_indent = Cm(1.25)
+    _dfont(p.add_run(text), size, bold)
+    return p
+
+
+def _page_number(section):
+    """Pastki o'rtada sahifa raqami (titul varaqda ko'rinmaydi)."""
+    section.different_first_page_header_footer = True
+    p = section.footer.paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run()
+    for kind, val in (("begin", None), ("instr", "PAGE"), ("end", None)):
+        if kind == "instr":
+            el = OxmlElement("w:instrText")
+            el.set(qn("xml:space"), "preserve")
+            el.text = val
+        else:
+            el = OxmlElement("w:fldChar")
+            el.set(qn("w:fldCharType"), kind)
+        run._r.append(el)
+    _dfont(run, 12)
+
+
+def _page_break(doc):
+    doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+
+
+def build_referat_docx(data: dict, topic: str, lang: str, author: str, path: str):
+    L = DOC_LABELS[lang]
+    doc = Document()
+    sec = doc.sections[0]
+    sec.left_margin, sec.right_margin = Cm(3), Cm(1.5)
+    sec.top_margin = sec.bottom_margin = Cm(2)
+    _page_number(sec)
+
+    # --- Titul varag'i ---
+    for _ in range(7):
+        doc.add_paragraph()
+    _dpara(doc, L["ref"], WD_ALIGN_PARAGRAPH.CENTER, 28, True, False, 12)
+    _dpara(doc, f"{L['topic']}: {data.get('title') or topic}", WD_ALIGN_PARAGRAPH.CENTER, 18, True,
+           False, 12)
+    for _ in range(6):
+        doc.add_paragraph()
+    if author:
+        _dpara(doc, f"{L['by']}: {author}", WD_ALIGN_PARAGRAPH.RIGHT, 14, False, False)
+    _dpara(doc, time.strftime("%Y"), WD_ALIGN_PARAGRAPH.CENTER, 14, False, False)
+    _page_break(doc)
+
+    # --- Reja ---
+    _dpara(doc, L["plan"], WD_ALIGN_PARAGRAPH.CENTER, 16, True, False, 8)
+    items = [L["intro"]] + [s["heading"] for s in data["sections"]] + [L["concl"]]
+    if data.get("sources"):
+        items.append(L["src"].capitalize())
+    for i, it in enumerate(items, start=1):
+        _dpara(doc, f"{i}. {it}", WD_ALIGN_PARAGRAPH.LEFT, 14, False, False)
+    _page_break(doc)
+
+    # --- Kirish ---
+    _dpara(doc, L["intro"].upper(), WD_ALIGN_PARAGRAPH.CENTER, 16, True, False, 8)
+    for t in str(data.get("intro", "")).split("\n"):
+        if t.strip():
+            _dpara(doc, t.strip())
+
+    # --- Asosiy qism ---
+    for k, s in enumerate(data["sections"], start=1):
+        _dpara(doc, f"{k}. {s['heading']}", WD_ALIGN_PARAGRAPH.LEFT, 15, True, False, 6)
+        for t in str(s["text"]).split("\n"):
+            if t.strip():
+                _dpara(doc, t.strip())
+
+    # --- Xulosa ---
+    _dpara(doc, L["concl"].upper(), WD_ALIGN_PARAGRAPH.CENTER, 16, True, False, 8)
+    for t in str(data.get("conclusion", "")).split("\n"):
+        if t.strip():
+            _dpara(doc, t.strip())
+
+    # --- Adabiyotlar ---
+    if data.get("sources"):
+        _page_break(doc)
+        _dpara(doc, L["src"], WD_ALIGN_PARAGRAPH.CENTER, 16, True, False, 8)
+        for i, src in enumerate(data["sources"], start=1):
+            _dpara(doc, f"{i}. {src}", WD_ALIGN_PARAGRAPH.LEFT, 14, False, False)
+    doc.save(path)
+
+
+async def generate_referat(topic: str, pages: int, lang: str) -> dict:
+    n = max(3, pages // 2 + 1)                      # asosiy bo'limlar soni
+    sec_words = max(150, (pages * 280 - 300) // n)  # har bo'limdagi taxminiy so'z soni
+    prompt = f"""Write an academic referat (essay) on the topic: "{topic}".
+Write ALL text in {LANGS[lang][1]}. Target length: about {pages} pages.
+
+Reply with ONLY this JSON:
+{{
+  "title": "Referat title",
+  "intro": "Introduction, about 150 words (relevance, goal, tasks). Paragraphs separated by \\n",
+  "sections": [{{"heading": "Section heading", "text": "About {sec_words} words, 2-4 paragraphs separated by \\n"}}],
+  "conclusion": "Conclusion, about 150 words. Paragraphs separated by \\n",
+  "sources": ["Author. Title. Publisher, Year."]
+}}
+
+Rules:
+- Exactly {n} items in "sections", logically ordered, concrete facts and examples, no filler.
+- Plain text only: no markdown, no bullet symbols, no asterisks.
+- "sources": 4-6 items, ONLY real, well-known books or institutions you are sure exist. If unsure, return an empty list. Never invent."""
+    last = None
+    for _ in range(2):
+        try:
+            d = extract_json(await gemini(prompt))
+            secs = [{"heading": str(s.get("heading", "")).strip()[:120],
+                     "text": str(s.get("text", "")).strip()}
+                    for s in (d.get("sections") or []) if isinstance(s, dict) and s.get("text")]
+            if secs:
+                return {"title": str(d.get("title", "")).strip(), "intro": str(d.get("intro", "")),
+                        "sections": secs, "conclusion": str(d.get("conclusion", "")),
+                        "sources": [str(x).strip() for x in (d.get("sources") or []) if str(x).strip()][:8]}
+            last = ValueError("Bo'limlar bo'sh")
+        except (ValueError, KeyError, json.JSONDecodeError) as e:
+            last = e
+    raise last
+
+
+@router.message(F.text == BTN_DOC)
+@router.message(Command("referat"))
+async def btn_doc(m: Message, state: FSMContext):
+    if get_credits(m.from_user.id, m.from_user.full_name) <= 0:
+        await state.clear()
+        await show_paywall(m)
+        return
+    cancel_prefetch(m.from_user.id)
+    await state.clear()
+    await state.set_state(Form.ref_topic)
+    await m.answer("📄 <b>Referat</b> mavzusini yozing, masalan:\n"
+                   "• <i>Global isish va uning oqibatlari</i>\n• <i>Amir Temur davri</i>\n\n"
+                   "Bekor qilish: /cancel", parse_mode="HTML", reply_markup=main_kb())
+
+
+@router.message(Form.ref_topic, F.text)
+async def ref_got_topic(m: Message, state: FSMContext):
+    topic = (m.text or "").strip()
+    if len(topic) < 3 or len(topic) > 200:
+        await m.answer("⚠️ Mavzu 3 dan 200 belgigacha bo'lishi kerak. Qayta yozing.")
+        return
+    await state.set_state(None)
+    await state.set_data({"ref_topic": topic})
+    kb = InlineKeyboardBuilder()
+    for n in DOC_PAGES:
+        kb.button(text=f"📄 {n} bet", callback_data=f"rp:{n}")
+    kb.adjust(3)
+    await m.answer(f"📝 Mavzu: <b>{html.escape(topic)}</b>\n\nNecha betlik referat kerak?",
+                   parse_mode="HTML", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("rp:"))
+async def ref_got_pages(c: CallbackQuery, state: FSMContext):
+    if "ref_topic" not in await state.get_data():
+        await c.answer("Avval referat mavzusini yozing: /referat", show_alert=True)
+        return
+    try:
+        n = int(c.data.split(":")[1])
+    except ValueError:
+        n = 0
+    if n not in DOC_PAGES:
+        await c.answer("Noto'g'ri tanlov", show_alert=True)
+        return
+    await state.update_data(ref_pages=n)
+    kb = InlineKeyboardBuilder()
+    for key, (name, _) in LANGS.items():
+        kb.button(text=name, callback_data=f"rl:{key}")
+    kb.adjust(1)
+    await c.message.edit_text(f"📄 Hajmi: <b>{n} bet</b>\n\n🌐 Tilni tanlang:",
+                              parse_mode="HTML", reply_markup=kb.as_markup())
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("rl:"))
+async def ref_generate(c: CallbackQuery, state: FSMContext):
+    uid = c.from_user.id
+    d = await state.get_data()
+    lang = c.data.split(":")[1]
+    if "ref_topic" not in d or "ref_pages" not in d or lang not in LANGS:
+        await c.answer("Avval /referat ni bosing", show_alert=True)
+        return
+    if uid in busy_users:
+        await c.answer("⏳ Oldingi so'rov bajarilmoqda, kuting...", show_alert=True)
+        return
+    if not reserve_credit(uid):
+        await c.answer()
+        await state.clear()
+        await show_paywall(c.message)
+        return
+    topic, pages = d["ref_topic"], d["ref_pages"]
+    busy_users.add(uid)
+    sent = False
+    path = None
+    await c.answer()
+    wait_txt = f"⏳ <b>{html.escape(topic)}</b> referati yozilmoqda (1-2 daqiqa)..."
+    status = await c.message.edit_text(wait_txt, parse_mode="HTML")
+    try:
+        async with gen_slot(status):
+            await safe_edit(status, wait_txt, parse_mode="HTML")
+            data = await generate_referat(topic, pages, lang)
+            author, _logo = get_profile(uid)
+            fd, path = tempfile.mkstemp(suffix=".docx")
+            os.close(fd)
+            await asyncio.to_thread(build_referat_docx, data, topic, lang, author, path)
+        left = "" if is_admin(uid) else f"\n💎 Qolgan limit: {max(get_credits(uid), 0)} ta"
+        await c.message.answer_document(
+            FSInputFile(path, filename=safe_name(topic, "docx")),
+            caption=f"✅ Referat tayyor! 📄 ~{pages} bet\n🎯 Mavzu: {topic}{left}\n\n"
+                    "Wordda ochib, o'zingizga moslab tahrirlang. Manbalarni tekshirib oling.")
+        sent = True
+        consume(uid)
+        await status.delete()
+    except Exception as e:
+        log.exception("Referat xatosi")
+        await safe_edit(status, err_text(e))
+    finally:
+        if not sent:
+            refund_credit(uid)
+        busy_users.discard(uid)
+        await state.clear()
+        rm(path)
+
+
 # ================================== ASOSIY ==================================
 @router.message(Form.topic, F.text)
 async def got_topic(m: Message, state: FSMContext):
@@ -3347,6 +3612,7 @@ async def main():
     dp.include_router(router)
     await bot.set_my_commands([
         BotCommand(command="new", description="📊 Yangi taqdimot"),
+        BotCommand(command="referat", description="📄 Referat (Word)"),
         BotCommand(command="bonus", description="🎉 Kunlik bonus"),
         BotCommand(command="history", description="🗂 Oldingi taqdimotlar"),
         BotCommand(command="balance", description="💎 Balans"),
