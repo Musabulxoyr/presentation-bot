@@ -18,7 +18,8 @@ Imkoniyatlar:
   - Avtomatik ZAXIRA (bazani adminga yuboradi) + /backup
   - Kunlik BONUS (150 so'm) + "Kunlik bonus" tugmasi va /bonus
   - Karta to'lovida chek skrinshot YOKI PDF ko'rinishida qabul qilinadi
-  - YANGI: 📄 REFERAT rejimi (Word .docx): mavzu -> 5/10/15 bet -> til -> tayyor fayl (/referat)
+  - 📄 REFERAT rejimi (Word .docx): mavzu -> 5/10/15 bet -> til -> tayyor fayl (/referat)
+  - YANGI: 1-taqdimot BEPUL, 2-taqdimotga 50% CHEGIRMA (har foydalanuvchiga 1 marta)
 
 O'rnatish:  pip install -r requirements.txt   (python-docx kerak)
 PDF uchun serverda LibreOffice kerak (nixpacks.toml ga qarang); bo'lmasa PDF tugmasi chiqmaydi.
@@ -80,7 +81,7 @@ _VOL = os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or ""
 DB_PATH = os.getenv("DB_PATH") or (os.path.join(_VOL, "bot.db") if _VOL else "bot.db")  # qo'lda: /data/bot.db
 PERSISTENT_DB = bool(os.getenv("DB_PATH") or _VOL)  # False bo'lsa baza deployda o'chib ketadi!
 
-FREE_LIMIT = 3          # har bir yangi foydalanuvchiga bepul taqdimotlar soni
+FREE_LIMIT = 1          # har bir yangi foydalanuvchiga bepul taqdimotlar soni (1-taqdimot bepul)
 FEEDBACK_RATE = 0.3     # har 10 ta taqdimotdan ~3 tasidan keyin fikr so'raladi (sinash uchun 1.0 qiling)
 REF_BONUS_SOM = 1000    # do'st birinchi taqdimotini yaratganda taklif qilganga balansiga tushadigan summa (so'm)
                         # bu pul faqat bot ichida ishlatiladi, yechib bo'lmaydi
@@ -110,6 +111,16 @@ PACKS = [
     (5, 60, 12000),
     (10, 100, 20000),
 ]
+
+# 2-taqdimotga 50% chegirma (har foydalanuvchiga faqat 1 marta): (soni, Stars, so'm)
+DISC_ID = 99
+DISC_PACK = (1, 8, 1500)
+
+
+def get_pack(i: int):
+    """Paketni indeks bo'yicha qaytaradi (99 = chegirmali paket)."""
+    return DISC_PACK if i == DISC_ID else PACKS[i]
+
 
 DEBUG = True  # xato sababini chatda ko'rsatadi; hammasi ishlab ketsa False qiling
 # =================================================================================
@@ -193,7 +204,7 @@ class Form(StatesGroup):
     author = State()
     logo = State()
     broadcast = State()
-    ref_topic = State()   # YANGI: referat mavzusi
+    ref_topic = State()   # referat mavzusi
 
 
 # ================================ BAZA ================================
@@ -260,6 +271,7 @@ def init_db():
         add_column(c, "users", "balance INTEGER NOT NULL DEFAULT 0")
         add_column(c, "users", "bonus_day TEXT")
         add_column(c, "users", "last_seen INTEGER")
+        add_column(c, "users", "disc_used INTEGER NOT NULL DEFAULT 0")  # 50% chegirma ishlatilganmi
 
 
 def meta_get(key: str, default: str = ""):
@@ -569,6 +581,23 @@ def som(n: int) -> str:
     return f"{n:,}".replace(",", " ")
 
 
+# ---------------- 50% chegirma (2-taqdimot) ----------------
+def discount_available(uid: int) -> bool:
+    """Chegirma: aynan 1 ta taqdimot yaratgan va chegirmani hali ishlatmagan foydalanuvchiga."""
+    if uid == ADMIN_ID:
+        return False
+    with closing(db()) as c:
+        r = c.execute("SELECT made, disc_used FROM users WHERE user_id=?", (uid,)).fetchone()
+    return bool(r and r["made"] == 1 and not r["disc_used"])
+
+
+def mark_disc(uid: int):
+    """Chegirma ishlatildi deb belgilaydi (qayta berilmaydi)."""
+    with closing(db()) as c:
+        c.execute("UPDATE users SET disc_used=1 WHERE user_id=?", (uid,))
+        c.commit()
+
+
 # ============================ AVTOMATIK ZAXIRA ============================
 def _gzip_file(src: str, dst: str):
     with open(src, "rb") as f_in, gzip.open(dst, "wb", compresslevel=6) as f_out:
@@ -772,8 +801,13 @@ def card_on() -> bool:
     return bool(CARD_NUMBER and ADMIN_ID)
 
 
-def packs_kb():
+def packs_kb(uid: int = 0):
+    """Paketlar. Chegirmaga haqli foydalanuvchiga eng tepada 🔥 -50% paket ko'rsatiladi."""
     kb = InlineKeyboardBuilder()
+    if uid and discount_available(uid):
+        n, stars, s = DISC_PACK
+        price = f"⭐️{stars} / {som(s)} so'm" if card_on() else f"⭐️{stars}"
+        kb.button(text=f"🔥 2-taqdimot −50%: {n} ta — {price}", callback_data=f"pack:{DISC_ID}")
     for i, (n, stars, s) in enumerate(PACKS):
         price = f"⭐️{stars} / {som(s)} so'm" if card_on() else f"⭐️{stars}"
         kb.button(text=f"💎 {n} ta taqdimot — {price}", callback_data=f"pack:{i}")
@@ -2061,7 +2095,8 @@ async def ask_topic(m: Message, state: FSMContext):
     await state.clear()
     await state.set_state(Form.topic)
     await m.answer(
-        "👋 Salom! Men sizga professional taqdimot tayyorlab beraman.\n\n"
+        "👋 Salom! Men sizga professional taqdimot tayyorlab beraman.\n"
+        "🎁 <b>1-taqdimot BEPUL</b>, 2-taqdimotga <b>50% chegirma</b>!\n\n"
         "✍️ Taqdimot mavzusini yozing, masalan:\n"
         "• <i>Global isish</i>\n• <i>Sun'iy intellekt kelajagi</i>\n• <i>Amir Temur</i>\n\n"
         "📄 Yoki <b>PDF / DOCX / TXT</b> fayl yuboring, men shu asosida taqdimot qilaman.\n"
@@ -2111,6 +2146,7 @@ async def cmd_skip(m: Message, state: FSMContext):
 async def cmd_help(m: Message):
     await m.answer(
         "ℹ️ <b>Qanday ishlaydi?</b>\n"
+        "🎁 1-taqdimot <b>bepul</b>, 2-taqdimotga <b>50% chegirma</b>!\n\n"
         "1️⃣ Mavzuni yozasiz (yoki PDF/DOCX/TXT fayl yuborasiz)\n"
         f"2️⃣ Slayd soni ({MIN_SLIDES}-{MAX_SLIDES}), til, rang va maketni tanlaysiz (maket namunalari ko'rsatiladi)\n"
         "3️⃣ Rasm kerakmi — tanlaysiz\n"
@@ -2135,7 +2171,7 @@ async def cmd_balance(m: Message):
                        f"💰 Bonus balans: <b>{som(money)} so'm</b> (faqat botda ishlatiladi)\n"
                        f"🎉 Har kuni /bonus orqali +{som(BONUS_SOM)} so'm oling!\n\n"
                        "➕ Paketni tanlang (balansdan ham to'lash mumkin):",
-                       parse_mode="HTML", reply_markup=packs_kb())
+                       parse_mode="HTML", reply_markup=packs_kb(m.from_user.id))
 
 
 @router.message(Command("bonus"))
@@ -2265,6 +2301,7 @@ async def cmd_stats(m: Message):
                              "WHERE score IS NOT NULL GROUP BY style ORDER BY a DESC").fetchall()
         bonus_today = c.execute("SELECT COUNT(*) FROM users WHERE bonus_day=?", (today_key(),)).fetchone()[0]
         never = c.execute("SELECT COUNT(*) FROM users WHERE made=0").fetchone()[0]
+        disc = c.execute("SELECT COUNT(*) FROM users WHERE disc_used=1").fetchone()[0]
         act1 = c.execute("SELECT COUNT(*) FROM users WHERE last_seen>=?", (now - 86400,)).fetchone()[0]
         act7 = c.execute("SELECT COUNT(*) FROM users WHERE last_seen>=?", (now - 7 * 86400,)).fetchone()[0]
         act30 = c.execute("SELECT COUNT(*) FROM users WHERE last_seen>=?", (now - 30 * 86400,)).fetchone()[0]
@@ -2279,6 +2316,7 @@ async def cmd_stats(m: Message):
         f"📊 Yaratilgan taqdimotlar (referatlar bilan): {made}\n✏️ Tahrirlar: {edits}\n"
         f"🎁 Referallar: {refs[0]} ta (bonus berilgan: {refs[1]})\n"
         f"🎉 Bugun kunlik bonus olganlar: {bonus_today}\n"
+        f"🔥 50% chegirmadan foydalanganlar: {disc}\n"
         f"😴 Hali taqdimot yaratmaganlar: {never} ta\n"
         f"🟢 Faol: 24 soatda {act1}, 7 kunda {act7}, 30 kunda {act30}\n"
         f"💤 7 kundan beri kirmaganlar: {max(users - act7, 0)} ta\n"
@@ -2324,7 +2362,8 @@ async def cmd_user(m: Message):
         f"👤 {html.escape(r['name'] or '')} (id {uid})\n💎 Limit: {r['credits']}\n"
         f"💰 Bonus balans: {som(r['balance'] or 0)} so'm\n📊 Yaratgan: {r['made']}\n🗂 Tarixda: {nd}\n🎁 Taklif qilgan: {a} (bonus: {b})\n"
         f"👥 Taklif qilgan odam: {r['referrer'] or '-'}\n✍️ Muallif: {html.escape(r['author'] or '-')}\n"
-        f"🎉 Oxirgi kunlik bonus: {r['bonus_day'] or '-'}",
+        f"🎉 Oxirgi kunlik bonus: {r['bonus_day'] or '-'}\n"
+        f"🔥 50% chegirma ishlatilgan: {'ha' if r['disc_used'] else 'yo`q'}",
         parse_mode="HTML")
 
 
@@ -2347,7 +2386,7 @@ async def btn_balance(m: Message):
 @router.message(F.text == BTN_BUY)
 async def btn_buy(m: Message):
     await m.answer("➕ <b>Balansni to'ldirish</b>\n\nPaketni tanlang:",
-                   parse_mode="HTML", reply_markup=packs_kb())
+                   parse_mode="HTML", reply_markup=packs_kb(m.from_user.id))
 
 
 @router.message(F.text == BTN_REF)
@@ -2366,13 +2405,25 @@ async def btn_help(m: Message):
 
 
 async def show_paywall(m: Message):
+    # m ba'zan botning o'z xabari bo'lishi mumkin (callback'dan), shuning uchun m.chat.id ishlatamiz
     await m.answer(
         "😔 <b>Bepul limitingiz tugadi.</b>\n\n"
         "➕ Davom etish uchun balansni to'ldiring, do'stlaringizni taklif qiling (/invite) "
         f"yoki har kuni /bonus orqali +{som(BONUS_SOM)} so'm yig'ing.\n"
         "💳 Karta orqali to'lasangiz, chekni <b>skrinshot</b> yoki <b>PDF</b> ko'rinishida yuborishingiz kifoya.\n"
         "Paketni tanlang:",
-        parse_mode="HTML", reply_markup=packs_kb())
+        parse_mode="HTML", reply_markup=packs_kb(m.chat.id))
+
+
+async def offer_discount(msg: Message, uid: int):
+    """1-taqdimotdan keyin 2-taqdimotga 50% chegirma taklifi."""
+    if discount_available(uid) and get_credits(uid) <= 0:
+        await msg.answer(
+            "🎁 <b>Maxsus taklif!</b>\n\n"
+            "Birinchi taqdimotingiz bepul edi. <b>2-taqdimotga 50% chegirma:</b>\n"
+            f"<s>{som(PACKS[0][2])} so'm</s> → <b>{som(DISC_PACK[2])} so'm</b> "
+            f"(⭐️{DISC_PACK[1]})\n\nTo'lov usulini tanlang 👇",
+            parse_mode="HTML", reply_markup=packs_kb(uid))
 
 
 async def take_topic(m: Message, state: FSMContext):
@@ -2642,6 +2693,12 @@ async def plan_ok(c: CallbackQuery, state: FSMContext):
                          f"💰 Balans: {som(get_money(ref))} so'm (bot ichida to'lashda ishlatiladi)")
             except Exception as e:
                 log.warning("Referalga xabar ketmadi: %s", e)
+
+        # 1-taqdimotdan keyin: 2-taqdimotga 50% chegirma taklifi
+        try:
+            await offer_discount(c.message, uid)
+        except Exception as e:
+            log.warning("Chegirma taklifi yuborilmadi: %s", e)
 
         # Har 10 ta taqdimotdan ~3 tasidan keyin fikr so'raymiz
         if random.random() < FEEDBACK_RATE:
@@ -3107,14 +3164,17 @@ async def got_comment(m: Message, state: FSMContext):
 @router.callback_query(F.data == "buy:menu")
 async def buy_menu(c: CallbackQuery):
     await c.message.edit_text("➕ <b>Balansni to'ldirish</b>\n\nPaketni tanlang:",
-                              parse_mode="HTML", reply_markup=packs_kb())
+                              parse_mode="HTML", reply_markup=packs_kb(c.from_user.id))
     await c.answer()
 
 
 @router.callback_query(F.data.startswith("pack:"))
 async def choose_pack(c: CallbackQuery):
     i = int(c.data.split(":")[1])
-    n, stars, s = PACKS[i]
+    if i == DISC_ID and not discount_available(c.from_user.id):
+        await c.answer("Bu chegirma sizga mavjud emas", show_alert=True)
+        return
+    n, stars, s = get_pack(i)
     kb = InlineKeyboardBuilder()
     kb.button(text=f"⭐️ {stars} Stars bilan to'lash", callback_data=f"pay:stars:{i}")
     money = get_money(c.from_user.id)
@@ -3124,7 +3184,8 @@ async def choose_pack(c: CallbackQuery):
         kb.button(text=f"💳 {som(s)} so'm (karta)", callback_data=f"pay:card:{i}")
     kb.button(text="⬅️ Orqaga", callback_data="buy:menu")
     kb.adjust(1)
-    await c.message.edit_text(f"📦 Paket: <b>{n} ta taqdimot</b>\n\nTo'lov usulini tanlang:",
+    title = "🔥 2-taqdimot (−50%)" if i == DISC_ID else f"{n} ta taqdimot"
+    await c.message.edit_text(f"📦 Paket: <b>{title}</b>\n\nTo'lov usulini tanlang:",
                               parse_mode="HTML", reply_markup=kb.as_markup())
     await c.answer()
 
@@ -3133,11 +3194,16 @@ async def choose_pack(c: CallbackQuery):
 async def pay_balance(c: CallbackQuery):
     uid = c.from_user.id
     i = int(c.data.split(":")[2])
-    n, _, s = PACKS[i]
+    if i == DISC_ID and not discount_available(uid):
+        await c.answer("Bu chegirma sizga mavjud emas", show_alert=True)
+        return
+    n, _, s = get_pack(i)
     if not spend_money(uid, s):
         have = get_money(uid)
         await c.answer(f"Balans yetarli emas: {som(have)} so'm bor, kerak {som(s)} so'm.", show_alert=True)
         return
+    if i == DISC_ID:
+        mark_disc(uid)
     new_payment(uid, "balance", s, "paid", "", n)
     add_credits(uid, n)
     await c.answer()
@@ -3150,10 +3216,13 @@ async def pay_balance(c: CallbackQuery):
 @router.callback_query(F.data.startswith("pay:stars:"))
 async def pay_stars(c: CallbackQuery):
     i = int(c.data.split(":")[2])
-    n, stars, _ = PACKS[i]
+    if i == DISC_ID and not discount_available(c.from_user.id):
+        await c.answer("Bu chegirma sizga mavjud emas", show_alert=True)
+        return
+    n, stars, _ = get_pack(i)
     await c.answer()
     await c.message.answer_invoice(
-        title="📊 Taqdimot paketi",
+        title="📊 Taqdimot paketi" + (" (−50%)" if i == DISC_ID else ""),
         description=f"{n} ta taqdimot yaratish",
         payload=f"pack:{i}",
         currency="XTR",  # Telegram Stars
@@ -3171,7 +3240,10 @@ async def stars_paid(m: Message):
     sp = m.successful_payment
     uid = m.from_user.id
     try:
-        n = PACKS[int(sp.invoice_payload.split(":")[1])][0]
+        pi = int(sp.invoice_payload.split(":")[1])
+        n = get_pack(pi)[0]
+        if pi == DISC_ID:
+            mark_disc(uid)
     except Exception:
         n = 1
     new_payment(uid, "stars", sp.total_amount, "paid", sp.telegram_payment_charge_id, n)
@@ -3193,7 +3265,10 @@ async def pay_card(c: CallbackQuery, state: FSMContext):
         await c.answer("Karta orqali to'lov hozircha yo'q", show_alert=True)
         return
     i = int(c.data.split(":")[2])
-    n, _, s = PACKS[i]
+    if i == DISC_ID and not discount_available(c.from_user.id):
+        await c.answer("Bu chegirma sizga mavjud emas", show_alert=True)
+        return
+    n, _, s = get_pack(i)
     await c.answer()
     await state.set_state(Form.receipt)
     await state.set_data({"pack": i})
@@ -3235,14 +3310,15 @@ async def got_receipt(m: Message, state: FSMContext):
         file_id, is_photo = doc.file_id, False
 
     i = (await state.get_data()).get("pack", 0)
-    n, _, s = PACKS[i]
+    n, _, s = get_pack(i)
     pid = new_payment(uid, "card", s, "pending", file_id, n)
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Tasdiqlash", callback_data=f"adm:ok:{pid}")
     kb.button(text="❌ Rad etish", callback_data=f"adm:no:{pid}")
     kb.adjust(2)
     cap = (f"💳 To'lov so'rovi #{pid}\n👤 {m.from_user.full_name} (id {uid})\n"
-           f"💰 {som(s)} so'm → {n} ta taqdimot" + ("" if is_photo else "\n📄 Chek PDF/fayl ko'rinishida"))
+           f"💰 {som(s)} so'm → {n} ta taqdimot" + (" (🔥 −50% chegirma)" if i == DISC_ID else "")
+           + ("" if is_photo else "\n📄 Chek PDF/fayl ko'rinishida"))
     if is_photo:
         await m.bot.send_photo(ADMIN_ID, file_id, reply_markup=kb.as_markup(), caption=cap)
     else:
@@ -3276,6 +3352,8 @@ async def admin_decide(c: CallbackQuery):
     log.info("Chek #%s %s: uid=%s +%s", pid, "TASDIQLANDI" if ok else "RAD", uid, n)
     try:
         if ok:
+            if row["kind"] == "card" and row["amount"] == DISC_PACK[2]:
+                mark_disc(uid)  # chegirmali paket to'landi: endi qayta berilmaydi
             add_credits(uid, n)
             await c.bot.send_message(uid, f"✅ To'lov tasdiqlandi! +{n} ta taqdimot.\n"
                                           f"💎 Jami: {get_credits(uid)} ta\n\n📊 Boshlash: /new")
@@ -3531,6 +3609,10 @@ async def ref_generate(c: CallbackQuery, state: FSMContext):
                     "Wordda ochib, o'zingizga moslab tahrirlang. Manbalarni tekshirib oling.")
         sent = True
         consume(uid)
+        try:
+            await offer_discount(c.message, uid)  # 1-ish tugagach 50% chegirma taklifi
+        except Exception as e:
+            log.warning("Chegirma taklifi yuborilmadi: %s", e)
         await status.delete()
     except Exception as e:
         log.exception("Referat xatosi")
