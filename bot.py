@@ -868,7 +868,8 @@ async def discover_models(session) -> list:
             params={"pageSize": 200}, headers={"x-goog-api-key": GEMINI_KEYS[0]},
         ) as r:
             j = await r.json()
-        bad = ("image", "tts", "live", "audio", "embedding", "robotics", "computer", "native")
+        bad = ("image", "tts", "live", "audio", "embedding", "robotics", "computer", "native",
+               "omni", "veo", "imagen")
         for m in j.get("models", []):
             name = m.get("name", "").split("/")[-1]
             if ("generateContent" in m.get("supportedGenerationMethods", [])
@@ -920,6 +921,10 @@ async def call_gemini(session, model: str, key: str, body: dict):
     return "retry", err
 
 
+class QuotaError(RuntimeError):
+    """Hamma kalit/modelda limit tugagan (429)."""
+
+
 async def gemini(prompt: str) -> str:
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -964,6 +969,8 @@ async def gemini(prompt: str) -> str:
                     break
             if len(dead) == len(keys):
                 raise RuntimeError(errors[-1] if errors else "API kalit xato")
+    if any("[429]" in e for e in errors):
+        raise QuotaError(" | ".join(errors[-3:]))
     raise RuntimeError(" | ".join(errors[-3:]) or "noma'lum xato")
 
 
@@ -1978,6 +1985,9 @@ async def safe_edit(msg: Message, body: str, **kw):
 
 
 def err_text(e: Exception) -> str:
+    if isinstance(e, QuotaError):
+        return ("⏳ Hozir AI juda band. 5–10 daqiqadan keyin /new orqali qayta urinib ko'ring.\n"
+                "💎 Limitingiz yechilmadi.")
     msg = "😔 Xatolik bo'ldi. Qayta urinib ko'ring: /new"
     if DEBUG:
         msg += f"\n\n🐞 {type(e).__name__}: {str(e)[:300]}"
